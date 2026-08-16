@@ -17,7 +17,7 @@ for a complete module.
 ## Install
 
 ```bash
-pi install git:github.com/sk-classroom/pi-pair-notebook@v0.2.0
+pi install git:github.com/sk-classroom/pi-pair-notebook@v0.3.0
 pi install npm:@juicesharp/rpiv-ask-user-question@2.4.0   # required companion
 ```
 
@@ -27,15 +27,36 @@ installs them itself on startup — students run nothing by hand:
 ```json
 {
   "packages": [
-    "git:github.com/sk-classroom/pi-pair-notebook@v0.2.0",
+    "git:github.com/sk-classroom/pi-pair-notebook@v0.3.0",
     "npm:@juicesharp/rpiv-ask-user-question@2.4.0"
   ]
 }
 ```
 
-Requirements: pi ≥ 0.84 (Node ≥ 24), `uv` (runs marimo), and `bash` + `curl`
-for the bridge. The tutor model may be text-only; a vision model is used
-separately for photographs.
+Requirements: pi ≥ 0.84 (Node ≥ 24) and `uv`, which is what actually runs the
+notebook. Nothing else — the toolkit speaks HTTP to marimo from Node, so there
+is no `bash`, `curl` or `jq` on a student's list. The tutor model may be
+text-only; photographs are read by a separate vision model.
+
+It also **runs the notebook server itself**: it starts
+`uvx marimo edit --sandbox --no-token --headless notebook.py` when the session
+opens, opens the student's page in their browser, and stops it when the session
+ends. There is no launcher script to keep in step across module folders, and
+nothing platform-specific in a shell.
+
+The module's `.pi/settings.json` carries the rest of what a launcher used to
+pass on the command line:
+
+```json
+{
+  "defaultProvider": "netsci",
+  "defaultModel": "tutor",
+  "defaultThinkingLevel": "low",
+  "hideThinkingBlock": true
+}
+```
+
+So the student's whole command is `pi`.
 
 ## What it gives the agent
 
@@ -116,7 +137,7 @@ tutor is told to describe the artifact *only* from it — a tutor once called a
 
 | variable | what |
 |---|---|
-| `MARIMO_URL` | the running marimo server. Set by the module's `run_tutor.sh`; defaults to `http://127.0.0.1:2718` |
+| `MARIMO_URL` | an ALREADY RUNNING marimo server. Set it and the toolkit attaches instead of starting one — that is how the review harness pins a session. Unset (the normal case) it starts its own |
 | `TUTOR_VISION_MODEL` | `provider/model-id` for reading photographs. Unset → an image-capable model on the tutor's own provider, then any zero-cost one; none found → the tutor asks the student to describe the drawing in words, which is a valid pass |
 | `TUTOR_REFEREE_MODEL` | `provider/model-id` for the ⚖️ appeal. Unreachable → the tutor resolves the appeal itself, generously |
 
@@ -129,7 +150,7 @@ pi -e /path/to/pi-pair-notebook/extensions/notebook-tool.ts   # load the working
 `-e` also works under `--no-extensions`, which is how the review harness pins a
 run to exactly one copy of the toolkit. To iterate against a checkout instead of
 a tag, point `.pi/settings.json` at the directory: a local path package
-(`"../pi-pair-notebook"`, relative to the settings file) is loaded in place, without
+(`"../toolkit"`, relative to the settings file) is loaded in place, without
 copying.
 
 Releases are pinned by tag. Bump `version` in `package.json`, tag `vX.Y.Z`, and
@@ -138,8 +159,9 @@ tested together, so nothing here floats on `main`.
 
 ## Credits
 
-`bridge/scripts/` is [marimo-pair](https://github.com/marimo-team/marimo-pair),
-vendored unmodified under Apache-2.0 — see [`bridge/README.md`](bridge/README.md).
+The two-call kernel protocol (`GET /api/sessions`, `POST /api/kernel/execute`)
+was learned from [marimo-pair](https://github.com/marimo-team/marimo-pair),
+whose `execute-code.sh` this package used to vendor and shell out to.
 Dialogs come from
 [`@juicesharp/rpiv-ask-user-question`](https://github.com/juicesharp/rpiv-mono).
 Everything else is MIT; see [`LICENSE`](LICENSE).

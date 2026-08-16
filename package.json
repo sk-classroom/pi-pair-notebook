@@ -1,7 +1,7 @@
 {
   "name": "@sk-classroom/pi-pair-notebook",
-  "version": "0.2.0",
-  "description": "Pi extension that turns a coding agent into a Socratic tutor working with a student inside a marimo notebook: a high-level nb_* toolkit, chapter-at-a-time curriculum, verbatim session log, and a referee the student can appeal to.",
+  "version": "0.3.0",
+  "description": "Pi extension that turns a coding agent into a Socratic tutor working with a student inside a marimo notebook: it runs the notebook server, gives the model a high-level nb_* toolkit, feeds it the curriculum one chapter at a time, keeps a verbatim session log, and lets the student appeal to a referee.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -23,7 +23,6 @@
   "type": "module",
   "files": [
     "extensions/",
-    "bridge/",
     "README.md",
     "LICENSE",
     "package.json"
@@ -42,14 +41,22 @@
   "//peerDependenciesMeta": [
     "Optional so that npm does not install them. pi bundles all four and",
     "resolves them for the extension itself; npm 7+ otherwise auto-installs",
-    "peers, and the pi SDK pulls every provider SDK with it — 236 MB of",
+    "peers, and the pi SDK pulls every provider SDK with it \u2014 236 MB of",
     "node_modules per student, per module clone, for code that is never read."
   ],
   "peerDependenciesMeta": {
-    "@earendil-works/pi-ai": { "optional": true },
-    "@earendil-works/pi-coding-agent": { "optional": true },
-    "@earendil-works/pi-tui": { "optional": true },
-    "typebox": { "optional": true }
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
   },
   "engines": {
     "node": ">=24"

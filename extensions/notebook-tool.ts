@@ -19,7 +19,7 @@
  * else the student explores (sliders, widgets) has no button — they say so
  * in the terminal and the tutor reads the values with nb_read.
  */
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,23 +29,8 @@ import { complete } from "@earendil-works/pi-ai/compat";
 import { Text } from "@earendil-works/pi-tui";
 import { keyHint, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-/** This file's directory — the package ships its own bridge next to it. */
+/** This file's directory. */
 const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
-
-// How every nb_* call reaches the marimo kernel. The script is marimo-pair's,
-// and it used to be fetched at first run: `git clone` into a cache, copy the
-// skill's scripts/ out, delete the rest. Under pi the SKILL must not be
-// installed — the model reaches for it mid-hint and a bare "[skill]
-// marimo-pair" line lands in the student's terminal — so only the scripts were
-// ever wanted, and they now ship inside this package (bridge/scripts/,
-// unmodified, Apache-2.0; see bridge/README.md). The staged copies below are
-// kept as fallbacks: a module folder from before the package still has one.
-const SCRIPT_CANDIDATES = [
-  path.join(EXT_DIR, "..", "bridge", "scripts", "execute-code.sh"),
-  ".pi/marimo-bridge/scripts/execute-code.sh",
-  ".pi/skills/marimo-pair/scripts/execute-code.sh",
-  ".claude/skills/marimo-pair/scripts/execute-code.sh",
-];
 
 /** JSON string literals are valid Python string literals. */
 const py = (s: string) => JSON.stringify(s);
@@ -165,40 +150,403 @@ const BOOTSTRAP =
   `    for _c in list(ctx.cells):\n` +
   `        ctx.run_cell(_c.id)\n`;
 
-function runKernel(code: string, signal?: AbortSignal): Promise<{ out: string; failed: boolean }> {
+// ---------------------------------------------------------------------------
+// Talking to the marimo kernel.
+//
+// Two HTTP calls, and that is the whole protocol:
+//   GET  /api/sessions          -> { "<session id>": { path, filename }, ... }
+//   POST /api/kernel/execute    -> an SSE stream of stdout / stderr / done
+//
+// This used to be marimo-pair's execute-code.sh, spawned through bash for every
+// nb_* call. That cost a bash + curl process per call and, worse, put `jq` and
+// `curl` on the list of things a student has to install — on Windows, where
+// Git Bash ships curl but not jq, that was the single most likely thing to
+// stop a first evening dead. Node speaks HTTP; nothing here needs a shell.
+// ---------------------------------------------------------------------------
+
+const KERNEL_TIMEOUT_MS = 180_000;
+/** How long a nb_* call waits for the student's notebook page to attach. */
+const SESSION_WAIT_MS = 90_000;
+
+// ---------------------------------------------------------------------------
+// The notebook server.
+//
+// This used to be a launcher script: start marimo, poll its log for a URL,
+// export MARIMO_URL, open a browser, start pi, kill marimo on exit. That script
+// was bash — which made Windows a support problem — and it lived in every
+// module folder, so fixing it meant editing every copy. It belongs here: the
+// package is versioned, pinned by tag, and Node already knows how to spawn a
+// process on three platforms.
+//
+// Nothing is awaited at startup. The student's first turn is a greeting, and
+// uv's first sandbox build can take a minute; the first nb_* call is where
+// waiting actually costs something, so that is where the wait happens.
+// ---------------------------------------------------------------------------
+
+const MARIMO_BOOT_MS = 180_000;
+
+/** Set when the extension loads; the server lifecycle lives at module level
+ *  because process signals do, and it occasionally needs to speak to the
+ *  tutor (a page that would not open by itself). */
+let piRef: any = null;
+
+let marimoProc: ReturnType<typeof spawn> | null = null;
+let marimoStart: Promise<{ url?: string; error?: string }> | null = null;
+
+/** An externally supplied server (the review harness, or an instructor running
+ *  marimo by hand) wins: never start a second one. */
+const externalMarimo = () => /^https?:\/\/\S+$/.test(process.env.MARIMO_URL ?? "");
+
+/** The student's own copy, made on first run so the template stays pristine. */
+function bootstrapNotebook(): void {
+  try {
+    const nb = path.join(process.cwd(), "notebook.py");
+    const tpl = path.join(process.cwd(), "notebook.template.py");
+    if (!fs.existsSync(nb) && fs.existsSync(tpl)) fs.copyFileSync(tpl, nb);
+  } catch {
+    // startMarimo will fail loudly enough if this mattered
+  }
+}
+
+function openInBrowser(url: string, onFailure: () => void): void {
+  // WSL first on Linux: xdg-open exists there but opens nothing a student sees.
+  const attempts: [string, string[]][] =
+    process.platform === "darwin"
+      ? [["open", [url]]]
+      : process.platform === "win32"
+        ? [["cmd", ["/c", "start", "", url]]]
+        : [
+            ["wslview", [url]],
+            ["xdg-open", [url]],
+            ["explorer.exe", [url]],
+          ];
+  const tryNext = (i: number) => {
+    if (i >= attempts.length) return onFailure();
+    const [cmd, args] = attempts[i];
+    try {
+      const child = spawn(cmd, args, { stdio: "ignore", detached: true });
+      child.on("error", () => tryNext(i + 1));
+      child.unref();
+    } catch {
+      tryNext(i + 1);
+    }
+  };
+  tryNext(0);
+}
+
+function startMarimo(): Promise<{ url?: string; error?: string }> {
   const cwd = process.cwd();
-  // resolve, not join: the packaged candidate is already absolute.
-  const script = SCRIPT_CANDIDATES.map((p) => path.resolve(cwd, p)).find(fs.existsSync);
-  if (!script) {
-    return Promise.resolve({
-      out:
-        "The notebook bridge (bridge/scripts/execute-code.sh, inside the pi-pair-notebook package) " +
-        "is missing, so " +
-        "nothing can reach the notebook. Tell the student, in one warm sentence, that the " +
-        "notebook needs restarting with ./run_tutor.sh — then keep teaching in the terminal.",
-      failed: true,
+  bootstrapNotebook();
+  let log: fs.WriteStream | null = null;
+  try {
+    fs.mkdirSync(path.join(cwd, "session_artifacts"), { recursive: true });
+    log = fs.createWriteStream(path.join(cwd, "session_artifacts", "marimo_server.log"), {
+      flags: "w",
+    });
+  } catch {
+    // a missing log is survivable; a missing server is not
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let seen = "";
+    let bootTimer: any = null;
+    const done = (r: { url?: string; error?: string }) => {
+      if (settled) return;
+      settled = true;
+      // Or the timer holds the event loop open for three minutes after the
+      // server is already up, and pi cannot exit when the student says bye.
+      if (bootTimer) clearTimeout(bootTimer);
+      resolve(r);
+    };
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(
+        "uvx",
+        ["marimo", "edit", "--sandbox", "--no-token", "--headless", "notebook.py"],
+        // Its own process group, so stopMarimo can take down the whole
+        // uv -> python -> marimo chain rather than just the wrapper.
+        { cwd, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] },
+      );
+    } catch (e: any) {
+      return done({ error: `could not start the notebook server: ${e?.message ?? e}` });
+    }
+    marimoProc = child;
+    const scan = (chunk: Buffer) => {
+      log?.write(chunk);
+      seen += chunk.toString();
+      const m = /http:\/\/[A-Za-z0-9.\-]+:\d+/.exec(seen);
+      if (m) done({ url: m[0] });
+    };
+    child.stdout?.on("data", scan);
+    child.stderr?.on("data", scan);
+    child.on("error", (e: any) =>
+      done({
+        error:
+          e?.code === "ENOENT"
+            ? "uv is not installed, so the notebook cannot start (install it: https://docs.astral.sh/uv/)"
+            : `could not start the notebook server: ${e?.message ?? e}`,
+      }),
+    );
+    child.on("exit", (code) =>
+      done({
+        error: `the notebook server stopped (exit ${code}) — session_artifacts/marimo_server.log has why`,
+      }),
+    );
+    bootTimer = setTimeout(
+      () => done({ error: "the notebook server did not come up in time" }),
+      MARIMO_BOOT_MS,
+    );
+  });
+}
+
+/** Start the server once, remember the result, open the student's page. */
+function marimoUrl(): Promise<{ url?: string; error?: string }> {
+  if (externalMarimo()) return Promise.resolve({ url: marimoBase() });
+  if (!marimoStart) {
+    marimoStart = startMarimo().then((r) => {
+      if (!r.url) return r;
+      // Everything downstream reads the env var, including a nb_run the
+      // student's own code might make.
+      process.env.MARIMO_URL = r.url;
+      openInBrowser(`${r.url}/?view-as=present`, () => {
+        // No browser opener on this machine — the tutor has to say it out loud,
+        // because a notebook nobody has open is a kernel that never wakes.
+        try {
+          piRef?.sendMessage(
+            {
+              customType: "notebook-url",
+              content:
+                `NOTE (invisible to the student): their notebook page did not open by itself. ` +
+                `Tell them in ONE sentence to open ${r.url}/?view-as=present in their browser, ` +
+                `then carry on.`,
+              display: false,
+            },
+            { deliverAs: "nextTurn" },
+          );
+        } catch {
+          /* best effort */
+        }
+      });
+      return r;
     });
   }
-  // Guard against a garbage env value (a broken grep once exported
-  // "Binary file ... matches" as the URL and every call failed).
+  return marimoStart;
+}
+
+function stopMarimo(): void {
+  const child = marimoProc;
+  marimoProc = null;
+  marimoStart = null;
+  if (!child?.pid) return;
+  try {
+    if (process.platform === "win32") {
+      spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+    } else {
+      process.kill(-child.pid, "SIGTERM"); // the group, not just uvx
+    }
+  } catch {
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      /* it is already gone */
+    }
+  }
+}
+
+// session_shutdown is the normal path; these catch the rest (Ctrl-C, a crash),
+// because a marimo left running holds port 2718 against the next session.
+for (const sig of ["exit", "SIGINT", "SIGTERM", "SIGHUP"] as const) {
+  process.on(sig, () => stopMarimo());
+}
+
+/** Guard against a garbage env value (a broken grep once exported
+ *  "Binary file ... matches" as the URL and every call failed). */
+function marimoBase(): string {
   const envUrl = process.env.MARIMO_URL ?? "";
   const url = /^https?:\/\/\S+$/.test(envUrl) ? envUrl : "http://127.0.0.1:2718";
-  return new Promise((resolve) => {
-    const child = execFile(
-      "bash",
-      [script, "--url", url, "-"],
-      // maxBuffer: nb_view_image pipes a base64 JPEG (~0.5MB) through stdout;
-      // node's 1MB default would kill the call mid-stream.
-      { cwd, timeout: 180_000, maxBuffer: 16 * 1024 * 1024 },
-      (err, stdout, stderr) => {
-        const combined = [stdout, stderr].filter(Boolean).join("\n").trim();
-        resolve({ out: combined, failed: err != null });
-      },
+  return url.replace(/\/+$/, "");
+}
+
+function marimoHeaders(extra?: Record<string, string>): Record<string, string> {
+  const token = process.env.MARIMO_TOKEN;
+  return { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...extra };
+}
+
+/** What the tutor is told when the notebook cannot be reached at all. */
+const NO_NOTEBOOK =
+  "The notebook is not reachable, so nothing can be built or read there right now. " +
+  "Tell the student, in one warm sentence, that the notebook needs restarting — then " +
+  "keep teaching in the terminal.";
+
+/**
+ * Which kernel session to run in. Resolved per call, never cached: marimo
+ * renames a session when the browser reconnects, and a stale id fails in a way
+ * that looks like broken code rather than a broken connection.
+ */
+async function resolveSession(signal: AbortSignal): Promise<{ id?: string; error?: string }> {
+  let sessions: Record<string, { path?: string; filename?: string }> = {};
+  let ids: string[] = [];
+  // A marimo kernel exists only while a browser client is attached. The page is
+  // opened for the student the moment the server reports its URL, but a cold
+  // laptop can take a while to render it — and the first nb_* call can easily
+  // arrive first. Waiting here is invisible; failing here costs the tutor a
+  // checkpoint and the student an apology for something that was about to work.
+  const deadline = Date.now() + SESSION_WAIT_MS;
+  for (;;) {
+    try {
+      const res = await fetch(`${marimoBase()}/api/sessions`, {
+        headers: marimoHeaders(),
+        signal,
+      });
+      if (!res.ok) return { error: `${NO_NOTEBOOK} (server said ${res.status})` };
+      sessions = (await res.json()) as typeof sessions;
+    } catch {
+      return { error: NO_NOTEBOOK };
+    }
+    ids = Object.keys(sessions ?? {});
+    if (ids.length > 0) break;
+    if (Date.now() >= deadline || signal.aborted) {
+      return {
+        error:
+          "The notebook page is not open, so its kernel is asleep and nothing can be built " +
+          "there. Ask the student to open the notebook tab (it may have been closed) — and " +
+          "keep teaching in the terminal meanwhile.",
+      };
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  if (ids.length === 1) return { id: ids[0] };
+  // More than one notebook on this server: pick ours by path.
+  const want = path.join(process.cwd(), "notebook.py");
+  const mine = ids.filter((id) => {
+    const s = sessions[id] ?? {};
+    return (
+      s.path === want ||
+      s.filename === want ||
+      path.basename(s.path ?? s.filename ?? "") === "notebook.py"
     );
-    signal?.addEventListener("abort", () => child.kill());
-    child.stdin?.write(code);
-    child.stdin?.end();
   });
+  if (mine.length === 1) return { id: mine[0] };
+  return {
+    error:
+      `${mine.length === 0 ? "No" : "More than one"} open notebook matches this folder ` +
+      `(${ids.length} on the server). ${NO_NOTEBOOK}`,
+  };
+}
+
+/**
+ * Run Python in the notebook's scratchpad and return everything it printed.
+ *
+ * `failed` is true when the kernel reported an error, when the stream ended
+ * without a `done` event (the code never ran), or when the server could not be
+ * reached — every caller treats those the same way: surface the RECOVERY line
+ * to the tutor, never to the student.
+ */
+async function runKernel(
+  code: string,
+  signal?: AbortSignal,
+): Promise<{ out: string; failed: boolean }> {
+  const timeout = AbortSignal.timeout(KERNEL_TIMEOUT_MS);
+  const abort = signal ? AbortSignal.any([signal, timeout]) : timeout;
+
+  // The server was started at load; this is where the first call waits for it.
+  const server = await marimoUrl();
+  if (!server.url) return { out: `${NO_NOTEBOOK} (${server.error})`, failed: true };
+
+  const session = await resolveSession(abort);
+  if (!session.id) return { out: session.error ?? NO_NOTEBOOK, failed: true };
+
+  let res: Response;
+  try {
+    res = await fetch(`${marimoBase()}/api/kernel/execute`, {
+      method: "POST",
+      headers: marimoHeaders({
+        "Content-Type": "application/json",
+        "Marimo-Session-Id": session.id,
+      }),
+      body: JSON.stringify({ code }),
+      signal: abort,
+    });
+  } catch {
+    return { out: NO_NOTEBOOK, failed: true };
+  }
+  if (!res.ok || !res.body) {
+    const detail = await res.text().catch(() => "");
+    return { out: `${NO_NOTEBOOK} (server said ${res.status}) ${detail}`.trim(), failed: true };
+  }
+
+  // SSE: "event: <name>" then "data: <json>", records separated by a blank
+  // line. stdout/stderr arrive as {"data": "..."} and concatenate without
+  // separators — they are a byte stream, not lines.
+  let stdout = "";
+  let stderr = "";
+  let failed = false;
+  let done = false;
+  let unparsed = "";
+  let event = "";
+  let buffer = "";
+
+  const handle = (line: string) => {
+    if (line.startsWith("event:")) {
+      event = line.slice(6).trim();
+      return;
+    }
+    if (line === "") return;
+    if (!line.startsWith("data:")) {
+      // Not SSE at all — an error body rather than a stream.
+      unparsed += line + "\n";
+      return;
+    }
+    const raw = line.slice(5).trim();
+    let payload: any;
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      unparsed += raw + "\n";
+      return;
+    }
+    switch (event) {
+      case "stdout":
+        stdout += payload?.data ?? "";
+        break;
+      case "stderr":
+        stderr += payload?.data ?? "";
+        break;
+      case "done":
+        // Carries the success bit and the last expression's output; errors
+        // already arrived as stderr.
+        if (payload?.success === false) failed = true;
+        else if (payload?.output?.data) stdout += payload.output.data + "\n";
+        done = true;
+        break;
+    }
+  };
+
+  try {
+    const decoder = new TextDecoder();
+    for await (const chunk of res.body as any) {
+      buffer += decoder.decode(chunk as Uint8Array, { stream: true });
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) !== -1) {
+        handle(buffer.slice(0, nl).replace(/\r$/, "")); // SSE permits CRLF
+        buffer = buffer.slice(nl + 1);
+      }
+    }
+    if (buffer) handle(buffer.replace(/\r$/, ""));
+  } catch {
+    return {
+      out: [stdout, stderr, "The notebook connection dropped mid-run."].filter(Boolean).join("\n"),
+      failed: true,
+    };
+  }
+
+  if (!done) {
+    failed = true;
+    stderr +=
+      "\nExecution did not complete: the server ended the stream without a result." +
+      (unparsed ? `\n${unparsed.trim()}` : "");
+  }
+  return { out: [stdout, stderr].filter(Boolean).join("\n").trim(), failed };
 }
 
 /**
@@ -367,7 +715,17 @@ const WAIVER_RULINGS = ["accept_and_close", "skip_ahead", "next_chapter"];
 function resolveRefereeModel(ctx: any): any | null {
   const reg = ctx?.modelRegistry;
   if (!reg) return null;
-  const pinned = (process.env.TUTOR_REFEREE_MODEL ?? "openrouter/z-ai/glm-5.2").trim();
+  // Default to a "referee" model on the tutor's OWN provider — a course
+  // gateway publishes tutor / vision / referee as three aliases, and the
+  // student has credentials for exactly that provider and no other. The
+  // launcher used to export this; nothing exports anything now.
+  const sameProvider = ctx?.model?.provider
+    ? (reg.find?.(ctx.model.provider, "referee") ?? null)
+    : null;
+  const pinned = (
+    process.env.TUTOR_REFEREE_MODEL ??
+    (sameProvider ? `${sameProvider.provider}/${sameProvider.id}` : "openrouter/z-ai/glm-5.2")
+  ).trim();
   if (!pinned.includes("/")) return null;
   const i = pinned.indexOf("/");
   const m = reg.find?.(pinned.slice(0, i), pinned.slice(i + 1));
@@ -1920,6 +2278,21 @@ const MARIMO_CELL_RULES =
   "(it even draws self-loops) or matplotlib figure always looks better.";
 
 export default function (pi: ExtensionAPI) {
+  piRef = pi;
+  // The notebook server, the student's copy of the notebook, and the browser
+  // page all come up here — nothing outside this package launches anything.
+  // Not awaited: uv's first sandbox build can take a minute, and the student's
+  // first turn is a hello. runKernel waits when waiting actually matters.
+  void marimoUrl();
+  // The tutor talks; it does not run commands. Every notebook and log
+  // operation goes through the quiet nb_* tools, so a raw shell would only
+  // ever scroll past the student mid-lesson.
+  try {
+    const active: string[] = pi.getActiveTools?.() ?? [];
+    if (active.includes("bash")) pi.setActiveTools?.(active.filter((n) => n !== "bash"));
+  } catch {
+    /* an older pi without tool management: AGENTS.md still forbids it */
+  }
   // Guards against a checkpoint's build landing in the wrong place: if the
   // tutor starts building checkpoint B before closing checkpoint A with
   // checkpoint_done, A's note cell gets created LATE and lands after B's
@@ -2043,6 +2416,13 @@ export default function (pi: ExtensionAPI) {
     }
   }, 2000);
   (signalTimer as any).unref?.();
+
+  // Normal exit, /resume, /new: take the notebook server with us. A marimo
+  // left behind holds port 2718 against the next session, and its kernel still
+  // has the previous student's variables in it.
+  pi.on("session_shutdown", async () => {
+    stopMarimo();
+  });
 
   pi.on("session_start", async (_event, _ctx) => {
     lastCtx = _ctx ?? lastCtx;
