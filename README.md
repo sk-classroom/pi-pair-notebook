@@ -79,8 +79,22 @@ things a prompt cannot.
 | `chapter_done` | gate the chapter transition on the student's own answer, write the handoff brief, load the next chapter |
 | `nb_fresh_start` | clear the notebook when the student chooses to start over |
 
-Four behaviours are worth knowing about, because they are what make the
+Six behaviours are worth knowing about, because they are what make the
 artifact trustworthy rather than plausible:
+
+- **It puts the notebook back.** A 60–90 minute lesson outlives a closed tab, a
+  sleeping laptop and an OOM-killed server, and any one of those used to end
+  the notebook for the rest of the session — the tutor announced that the
+  whiteboard needed restarting and nobody could restart it. A tab that has gone
+  is reopened mid-wait; a server that has died is started again once a minute
+  at most; and the student sees neither, only a tool call that took longer.
+  A server someone else started (`MARIMO_URL`) is never touched.
+- **The pickers take typed answers.** pi's `ctx.ui.select` swallows every
+  printable key: a student answering by typing sees nothing appear and their
+  Enter then picks whatever row the cursor is on. Both halves of that were
+  reproduced live. Every picker this package opens therefore carries a
+  ✎ *Let me type something instead* row, and the tutor is handed their actual
+  words.
 
 - **Chapter-at-a-time context.** The tutor never holds the whole curriculum.
   The extension injects one `CHAPTER SCRIPT` at a time and, at `chapter_done`,
@@ -101,6 +115,14 @@ artifact trustworthy rather than plausible:
   so displays that would silently vanish get wrapped in one `mo.vstack`,
   unrescuable cells are refused with an instruction, and ASCII-art diagrams are
   flagged.
+
+Two smaller ones in the same spirit: the checkpoint id a tool is given is
+**snapped back onto the script** when it is a near miss (`cp3-clustering` for
+`cp3_clustering` otherwise silently disables the note skeleton, both guards and
+the closing tally at once), and the gaps a guard gives up on — a build that
+never happened, a paper checkpoint with no photo, an appeal — are now **stamped
+on the row and printed in the summary** instead of being written and read by
+nobody.
 
 There is also a **referee**: the notebook carries a ⚖️ box the student can press
 to appeal over the tutor's head. The whole situation — their case, the log, the

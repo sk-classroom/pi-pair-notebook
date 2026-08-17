@@ -194,8 +194,14 @@ let marimoProc: ReturnType<typeof spawn> | null = null;
 let marimoStart: Promise<{ url?: string; error?: string }> | null = null;
 
 /** An externally supplied server (the review harness, or an instructor running
- *  marimo by hand) wins: never start a second one. */
-const externalMarimo = () => /^https?:\/\/\S+$/.test(process.env.MARIMO_URL ?? "");
+ *  marimo by hand) wins: never start a second one.
+ *
+ *  Read ONCE, at load. marimoUrl() writes our own URL into the same variable
+ *  so that nb_run's student code can find it, so anything asking later cannot
+ *  tell "the harness gave us a server" from "we started one" — and the restart
+ *  path below has to know the difference. */
+const EXTERNAL_MARIMO = /^https?:\/\/\S+$/.test(process.env.MARIMO_URL ?? "");
+const externalMarimo = () => EXTERNAL_MARIMO;
 
 /** The student's own copy, made on first run so the template stays pristine. */
 function bootstrapNotebook(): void {
@@ -225,7 +231,25 @@ function openInBrowser(url: string, onFailure: () => void): void {
     const [cmd, args] = attempts[i];
     try {
       const child = spawn(cmd, args, { stdio: "ignore", detached: true });
-      child.on("error", () => tryNext(i + 1));
+      let settled = false;
+      const next = () => {
+        if (settled) return;
+        settled = true;
+        tryNext(i + 1);
+      };
+      child.on("error", next);
+      // "The command exists" is not "the page opened". On WSL and on a
+      // locked-down desktop, xdg-open is present and exits non-zero — and
+      // because only the ENOENT path was watched, neither the next opener nor
+      // onFailure ever ran. The student was left with a notebook nobody had
+      // opened, no kernel, and a tutor that had not been told to say the URL
+      // out loud. Give it a moment to fail before believing it.
+      child.on("exit", (code) => {
+        if (code) next();
+        else settled = true;
+      });
+      const grace = setTimeout(() => (settled = true), 4000);
+      (grace as any).unref?.();
       child.unref();
     } catch {
       tryNext(i + 1);
@@ -240,8 +264,10 @@ function startMarimo(): Promise<{ url?: string; error?: string }> {
   let log: fs.WriteStream | null = null;
   try {
     fs.mkdirSync(path.join(cwd, "session_artifacts"), { recursive: true });
+    // Append, not truncate: a restart that erased the previous server's last
+    // words would delete the only record of why it died.
     log = fs.createWriteStream(path.join(cwd, "session_artifacts", "marimo_server.log"), {
-      flags: "w",
+      flags: "a",
     });
   } catch {
     // a missing log is survivable; a missing server is not
@@ -333,6 +359,58 @@ function marimoUrl(): Promise<{ url?: string; error?: string }> {
   return marimoStart;
 }
 
+/**
+ * Bring a server we started back after it died, and reopen the student's page.
+ *
+ * A lesson runs 60-90 minutes and outlives a lot: the laptop sleeps, the tab
+ * gets closed, marimo is OOM-killed. Before this existed any one of those
+ * ended the notebook for the rest of the session — the tutor said "the
+ * whiteboard needs a restart" (it is told to), the student had no way to
+ * restart it, and every remaining checkpoint went unbuilt while the graded
+ * artifact stopped growing. Killing marimo mid-checkpoint in a live run left
+ * exactly that: a session that talked its way to the end with nothing on the
+ * page.
+ *
+ * Never touches a server someone else started — the review harness pins one
+ * on purpose, and an instructor running marimo by hand would not thank us.
+ * Rate-limited, so a genuinely unstartable server (no uv, a busy port) costs
+ * one boot attempt per minute rather than one per tool call.
+ */
+const RELAUNCH_COOLDOWN_MS = 60_000;
+let lastRelaunch = 0;
+let lastReopen = 0;
+
+/**
+ * Put the student's notebook tab back. A marimo kernel exists only while a
+ * browser client is attached, so a closed tab is indistinguishable, from
+ * here, from a dead server — except that it is far commoner and far cheaper
+ * to fix. Works for a harness-supplied server too: reopening someone else's
+ * page costs them nothing.
+ */
+function reopenPage(): boolean {
+  if (Date.now() - lastReopen < RELAUNCH_COOLDOWN_MS) return false;
+  lastReopen = Date.now();
+  try {
+    openInBrowser(`${marimoBase()}/?view-as=present`, () => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function relaunchMarimo(): Promise<boolean> {
+  if (externalMarimo()) return false;
+  if (Date.now() - lastRelaunch < RELAUNCH_COOLDOWN_MS) return false;
+  lastRelaunch = Date.now();
+  stopMarimo(); // clears the cached start promise, and reaps a half-dead chain
+  try {
+    const r = await marimoUrl();
+    return !!r.url;
+  } catch {
+    return false;
+  }
+}
+
 function stopMarimo(): void {
   const child = marimoProc;
   marimoProc = null;
@@ -383,7 +461,17 @@ const NO_NOTEBOOK =
  * renames a session when the browser reconnects, and a stale id fails in a way
  * that looks like broken code rather than a broken connection.
  */
-async function resolveSession(signal: AbortSignal): Promise<{ id?: string; error?: string }> {
+type SessionLookup = {
+  id?: string;
+  error?: string;
+  /** Why it failed, so the caller can pick the right repair: a server that is
+   *  gone needs restarting, a page the student closed only needs reopening —
+   *  and restarting a healthy server to fix a closed tab costs the student a
+   *  minute and a half of silence for nothing. */
+  reason?: "unreachable" | "no-page" | "ambiguous";
+};
+
+async function resolveSession(signal: AbortSignal): Promise<SessionLookup> {
   let sessions: Record<string, { path?: string; filename?: string }> = {};
   let ids: string[] = [];
   // A marimo kernel exists only while a browser client is attached. The page is
@@ -392,45 +480,67 @@ async function resolveSession(signal: AbortSignal): Promise<{ id?: string; error
   // arrive first. Waiting here is invisible; failing here costs the tutor a
   // checkpoint and the student an apology for something that was about to work.
   const deadline = Date.now() + SESSION_WAIT_MS;
+  // If nothing has attached after a few seconds, the likeliest reason is not
+  // a slow laptop but a tab that was closed — students close tabs. Put it
+  // back while we are still waiting, rather than spending the full ninety
+  // seconds first and only then noticing. Rate-limited inside reopenPage, so
+  // a machine with no browser opener at all does not get spammed.
+  const nudgeAt = Date.now() + 8_000;
+  let nudged = false;
   for (;;) {
     try {
       const res = await fetch(`${marimoBase()}/api/sessions`, {
         headers: marimoHeaders(),
         signal,
       });
-      if (!res.ok) return { error: `${NO_NOTEBOOK} (server said ${res.status})` };
+      if (!res.ok)
+        return { error: `${NO_NOTEBOOK} (server said ${res.status})`, reason: "unreachable" };
       sessions = (await res.json()) as typeof sessions;
     } catch {
-      return { error: NO_NOTEBOOK };
+      return { error: NO_NOTEBOOK, reason: "unreachable" };
     }
     ids = Object.keys(sessions ?? {});
     if (ids.length > 0) break;
     if (Date.now() >= deadline || signal.aborted) {
       return {
+        reason: "no-page",
         error:
           "The notebook page is not open, so its kernel is asleep and nothing can be built " +
           "there. Ask the student to open the notebook tab (it may have been closed) — and " +
           "keep teaching in the terminal meanwhile.",
       };
     }
+    if (!nudged && Date.now() >= nudgeAt) {
+      nudged = true;
+      reopenPage();
+    }
     await new Promise((r) => setTimeout(r, 500));
   }
   if (ids.length === 1) return { id: ids[0] };
-  // More than one notebook on this server: pick ours by path.
+  // More than one notebook on this server: pick ours by path. Exact first —
+  // the basename rule matches any notebook.py anywhere, which is a fallback
+  // for a marimo that reports paths differently, not a way to choose.
   const want = path.join(process.cwd(), "notebook.py");
-  const mine = ids.filter((id) => {
+  const exact = ids.filter((id) => {
     const s = sessions[id] ?? {};
-    return (
-      s.path === want ||
-      s.filename === want ||
-      path.basename(s.path ?? s.filename ?? "") === "notebook.py"
-    );
+    return s.path === want || s.filename === want;
   });
-  if (mine.length === 1) return { id: mine[0] };
+  const mine = exact.length
+    ? exact
+    : ids.filter((id) => {
+        const s = sessions[id] ?? {};
+        return path.basename(s.path ?? s.filename ?? "") === "notebook.py";
+      });
+  // Ambiguity used to be fatal, and fatal here means fatal for the session:
+  // the error carried NO_NOTEBOOK, which tells the tutor to announce that the
+  // whiteboard needs restarting and finish in the terminal — over a server
+  // that is running, healthy, and holding the student's own notebook. Guessing
+  // wrong costs one cell in the wrong page; refusing costs the artifact. So
+  // take the first match and keep going.
+  if (mine.length >= 1) return { id: mine[0] };
   return {
-    error:
-      `${mine.length === 0 ? "No" : "More than one"} open notebook matches this folder ` +
-      `(${ids.length} on the server). ${NO_NOTEBOOK}`,
+    reason: "ambiguous",
+    error: `No open notebook matches this folder (${ids.length} on the server). ${NO_NOTEBOOK}`,
   };
 }
 
@@ -445,7 +555,7 @@ async function resolveSession(signal: AbortSignal): Promise<{ id?: string; error
 async function runKernel(
   code: string,
   signal?: AbortSignal,
-): Promise<{ out: string; failed: boolean }> {
+): Promise<{ out: string; failed: boolean; reason?: string }> {
   const timeout = AbortSignal.timeout(KERNEL_TIMEOUT_MS);
   const abort = signal ? AbortSignal.any([signal, timeout]) : timeout;
 
@@ -453,8 +563,15 @@ async function runKernel(
   const server = await marimoUrl();
   if (!server.url) return { out: `${NO_NOTEBOOK} (${server.error})`, failed: true };
 
-  const session = await resolveSession(abort);
-  if (!session.id) return { out: session.error ?? NO_NOTEBOOK, failed: true };
+  let session = await resolveSession(abort);
+  // A closed tab is already handled inside resolveSession, which puts the page
+  // back mid-wait. What is left here is the server itself being gone: start it
+  // again, once, and look for the kernel a second time.
+  if (!session.id && !abort.aborted && session.reason === "unreachable") {
+    if (await relaunchMarimo()) session = await resolveSession(abort);
+  }
+  if (!session.id)
+    return { out: session.error ?? NO_NOTEBOOK, failed: true, reason: session.reason };
 
   let res: Response;
   try {
@@ -953,17 +1070,29 @@ async function handleAppeal(pi: any): Promise<void> {
   }
 }
 
-function toResult({ out, failed }: { out: string; failed: boolean }) {
+function toResult({ out, failed, reason }: { out: string; failed: boolean; reason?: string }) {
   let text = failed ? `NOTEBOOK ERROR:\n${out || "(no output)"}` : out || "(ok)";
   if (failed) {
     // Tell the model exactly what to do — otherwise it starts "debugging"
     // with skills, shell, and log files in front of the student.
-    text += out.includes("No active sessions")
-      ? `\nRECOVERY: the notebook tab isn't open in the browser. Ask the student to open ` +
-        `or refresh the notebook page, wait for their reply, then retry this call.`
-      : `\nRECOVERY: retry this call ONCE. If it fails again, tell the student the ` +
-        `whiteboard is unavailable and continue in terminal-only mode (AGENTS.md) — ` +
-        `do NOT investigate with skills, shell, or log files.`;
+    //
+    // This used to branch on out.includes("No active sessions") — a string
+    // that appears nowhere else in this repo and that marimo never returns.
+    // So the one case with a real, cheap fix (their tab is closed; ask them to
+    // open it) always fell through to "tell them the whiteboard is
+    // unavailable and continue in terminal-only mode", which ends the notebook
+    // for the rest of the session over a browser tab. The reason now travels
+    // as a field instead of being guessed from prose.
+    text +=
+      reason === "no-page"
+        ? `\nRECOVERY: the notebook server is fine — the student's notebook TAB is closed, ` +
+          `so the page has no kernel. Ask them, in one warm sentence, to open ` +
+          `${marimoBase()}/?view-as=present (it may already be reopening by itself), wait ` +
+          `for their reply, then retry this call. Do NOT switch to terminal-only mode for ` +
+          `this and do NOT tell them the whiteboard is broken.`
+        : `\nRECOVERY: retry this call ONCE. If it fails again, tell the student the ` +
+          `whiteboard is unavailable and continue in terminal-only mode (AGENTS.md) — ` +
+          `do NOT investigate with skills, shell, or log files.`;
   }
   return {
     content: [{ type: "text" as const, text }],
@@ -971,20 +1100,137 @@ function toResult({ out, failed }: { out: string; failed: boolean }) {
   };
 }
 
-/** Shared quiet renderers: student sees a status line and a checkmark. */
-const quietRender = {
+// ── Is the tutor's own model actually reachable? ────────────────────────────
+// The course endpoint moved once, and every machine still pointing at the old
+// host got, in full, this: "Error: Connection error." — four times, then
+// "Retry failed after 3 attempts". No URL, no status, no mention of a key, no
+// suggestion. On a student who has never used a terminal that is the end of
+// the assignment, and the instructor hears "it doesn't work".
+//
+// So the session opens by asking the provider whether it is there. It costs
+// one HTTP call against an endpoint that must work anyway, it happens before
+// the student has typed anything, and it names the three things that are ever
+// wrong: the address, the key, or the network. Silent when all is well.
+async function preflightProvider(ctx: any): Promise<string | null> {
+  const model = ctx?.model;
+  const provider = model?.provider;
+  if (!provider) return null;
+  let auth: any;
+  try {
+    // Same call the vision path uses: {ok, apiKey, headers, baseUrl}.
+    auth = await ctx.modelRegistry?.getApiKeyAndHeaders?.(model);
+  } catch {
+    return null;
+  }
+  if (!auth?.ok) return null;
+  const baseUrl = String(
+    auth.baseUrl ?? ctx.modelRegistry?.getProvider?.(provider)?.baseUrl ?? "",
+  ).replace(/\/+$/, "");
+  // A built-in provider with no configured baseUrl of its own is not what this
+  // is for — those speak their vendor's endpoint and diagnose themselves.
+  if (!/^https?:\/\//.test(baseUrl)) return null;
+
+  const fix =
+    `What to do: run  node setup-pi.mjs  in this folder — it rewrites the course ` +
+    `settings and tells you which part is wrong. If it still fails, send your ` +
+    `instructor the line above.`;
+  try {
+    const res = await fetch(`${baseUrl}/models`, {
+      headers: {
+        ...(auth.headers ?? {}),
+        ...(auth.apiKey ? { Authorization: `Bearer ${auth.apiKey}` } : {}),
+      },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (res.ok) return null;
+    if (res.status === 401 || res.status === 403) {
+      return (
+        `Your course key was refused by ${baseUrl} (HTTP ${res.status}).\n` +
+        `Check NETSCI_API_KEY in this terminal — a missing character or a stray ` +
+        `space is the usual cause, and a key set in another window does not ` +
+        `count.\n${fix}`
+      );
+    }
+    if (res.status === 429) {
+      return (
+        `The course server says you are over your allowance for now (HTTP 429).\n` +
+        `See what is left at ${baseUrl}/usage, and tell your instructor if that ` +
+        `looks wrong.`
+      );
+    }
+    return `The course server answered ${baseUrl} with HTTP ${res.status}.\n${fix}`;
+  } catch (e: any) {
+    const why =
+      e?.name === "TimeoutError" ? "it did not answer in 15 seconds" : (e?.message ?? String(e));
+    return (
+      `Could not reach the course server at ${baseUrl} — ${why}.\n` +
+      `If you are online, the address in your settings may be out of date.\n${fix}`
+    );
+  }
+}
+
+// ── Pickers the student can type into ──────────────────────────────────────
+// pi's ctx.ui.select swallows every printable key. A student who answers by
+// typing while a picker is open sees NOTHING appear on screen — no echo, no
+// warning — and their Enter then selects whatever row the cursor happens to
+// be on. Both halves of that were reproduced in one live run: the sentence
+// was gone and the choice was not theirs. The tutor's own contract warns the
+// TUTOR about this ("a picker takes the keyboard"), but the student, who is
+// the one holding the keyboard, was never protected at all.
+//
+// So every picker this toolkit opens carries a typed-answer row, and its
+// title says how to drive it. The row cannot rescue keys pressed before the
+// student notices — nothing can, from outside pi — but it does mean there is
+// always somewhere for their words to go, and that a beginner who types out
+// of habit finds the way through in the list they are already looking at.
+const TYPE_IT = "✎ Let me type something instead";
+
+async function askStudent(
+  ctx: any,
+  title: string,
+  options: string[],
+): Promise<{ choice: string | null; typed: string; asked: boolean }> {
+  if (!ctx?.ui?.select) return { choice: null, typed: "", asked: false };
+  const choice = await ctx.ui.select(`${title}   ↑↓ then Enter`, [...options, TYPE_IT]);
+  if (choice !== TYPE_IT) return { choice: choice ?? null, typed: "", asked: true };
+  let typed = "";
+  try {
+    typed = String((await ctx.ui.input?.("Type it here, then Enter:", "")) ?? "").trim();
+  } catch {
+    /* an older pi without ui.input: falls through as an empty typed answer */
+  }
+  return { choice: TYPE_IT, typed, asked: true };
+}
+
+/**
+ * Shared quiet renderers: student sees a status line and a checkmark.
+ *
+ * `fallback` is what the line says when the model sends no `status`. It used
+ * to be one generic sentence for every tool, which was fine while `status` was
+ * required — but required meant a model that forgot it lost the whole call, so
+ * it is optional now, and a small model promptly stopped sending it at all: a
+ * live run showed "Working in the notebook…" four times in a row where the
+ * student had been getting "Noting your experience level…". Optional keeps the
+ * checkpoint; a per-tool fallback keeps the warmth.
+ */
+const quiet = (fallback: string) => ({
   renderCall(args: { status?: string }, theme: any) {
     const status =
       // .trim(): a status of a single space passed the length test and
       // printed a bare "📝  ✓" at the student.
       typeof args?.status === "string" && args.status.trim().length > 0
         ? args.status.trim()
-        : "Working in the notebook…";
+        : fallback;
     return new Text(theme.fg("accent", `📝 ${status}`), 0, 0);
   },
   renderResult(result: any, { expanded, isPartial }: any, theme: any) {
     if (isPartial) return new Text(theme.fg("muted", "…"), 0, 0);
-    if (result?.details?.failed === true) {
+    // `details` is set by every path through execute(). Its ABSENCE means
+    // execute never ran — pi rejected the arguments against the schema first —
+    // and that used to render as a green ✓ while nothing had happened, with
+    // the model's whole rejected payload (question, verbatim answer, note
+    // markdown) printed into the student's terminal beside it.
+    if (result?.details?.failed === true || result?.isError === true || !result?.details) {
       return new Text(theme.fg("error", "⚠ something hiccuped — your tutor is on it"), 0, 0);
     }
     const raw =
@@ -1000,14 +1246,28 @@ const quietRender = {
     if (raw && raw !== "(ok)") line += " " + theme.fg("dim", `(${keyHint("app.tools.expand", "for details")})`);
     return new Text(line, 0, 0);
   },
-};
-
-const STATUS_PARAM = Type.String({
-  description:
-    "Short student-facing status in plain, friendly words, e.g. 'Preparing our next step…'. " +
-    "No technical terms, no cell/code/error talk — and NEVER a fact the checkpoint you are " +
-    "on is asking them to find (it is shown at the moment you build that checkpoint).",
 });
+
+/** The generic pair, for tools with nothing more specific to say. */
+const quietRender = quiet("Working in the notebook…");
+
+// Optional on purpose. It is a nicety — one friendly line above a spinner —
+// and renderCall already has a default for it, but as a required field a model
+// that forgot it lost the whole call: pi rejects the arguments before execute
+// runs, so the build never happens, the student watches the rejected payload
+// scroll past, and the tutor apologises for a field it cannot name. Nothing
+// that only decorates the screen should be able to fail a checkpoint.
+const STATUS_PARAM = Type.Optional(
+  Type.String({
+    description:
+      "ALWAYS send this. Short student-facing status in plain, friendly words, e.g. " +
+      "'Preparing our next step…'. It is the only thing on their screen while the call " +
+      "runs, so a specific one ('Noting how you like to learn…') is worth far more than " +
+      "the generic line they get without it. No technical terms, no cell/code/error " +
+      "talk — and NEVER a fact the checkpoint you are on is asking them to find (it is " +
+      "shown at the moment you build that checkpoint).",
+  }),
+);
 
 // ── Chapter orchestration (the deterministic "lead agent") ──────────────────
 // The lesson is split into chapters (lesson/index.json). The tutor holds only
@@ -1053,6 +1313,59 @@ function baseCheckpointId(id: string): string {
 
 function isScriptedCheckpoint(id: string): boolean {
   return checkpointOrder().includes(baseCheckpointId(id));
+}
+
+/**
+ * Pull a checkpoint id back onto the script when the model has drifted near it.
+ *
+ * `judgment` is validated against a list and `student_response` against empty,
+ * but `id` — the key everything else is looked up by — was taken as given. One
+ * character out (`cp3-clustering` for `cp3_clustering`) and four things fail at
+ * once, none of them visibly: the note skeleton is not found, so the
+ * instructor's note cell never reaches the keepsake; the build guard and the
+ * ordering guard stop recognising the checkpoint; and the closing summary
+ * reports "14 of 15" while the notebook shows an answer under a misspelled
+ * heading. A weak model produces exactly this kind of drift, and
+ * baseCheckpointId's own comment records a real one (`cp0_welcome_extra_extra`).
+ *
+ * Snapping beats refusing: the tutor has already asked the question and heard
+ * the answer, and a refusal it cannot satisfy costs the student the row. Only
+ * near misses snap — case, the -/_ confusion, and one edit away — so an id for
+ * a genuinely different checkpoint still falls through to the caller's refusal.
+ */
+function snapCheckpointId(id: string): { id: string; snappedFrom?: string } {
+  const base = baseCheckpointId(id);
+  const order = checkpointOrder();
+  if (order.includes(base)) return { id };
+  const suffix = id.slice(base.length); // "_extra", "_extra2", ""
+  const norm = (s: string) => s.toLowerCase().replace(/[-\s.]/g, "_");
+  const target = norm(base);
+  let hit = order.find((c) => norm(c) === target);
+  if (!hit) {
+    // One edit away (a dropped, doubled or swapped character), and only when
+    // exactly one candidate is that close — an ambiguous near miss is not a
+    // near miss.
+    const within1 = order.filter((c) => editDistanceAtMost(norm(c), target, 1));
+    if (within1.length === 1) hit = within1[0];
+  }
+  return hit ? { id: hit + suffix, snappedFrom: id } : { id };
+}
+
+/** True when `a` and `b` differ by at most `max` insertions/deletions/substitutions. */
+function editDistanceAtMost(a: string, b: string, max: number): boolean {
+  if (Math.abs(a.length - b.length) > max) return false;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    let best = i;
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = a[i - 1] === b[j - 1] ? prev[j - 1] : 1 + Math.min(prev[j - 1], prev[j], cur[j - 1]);
+      best = Math.min(best, cur[j]);
+    }
+    if (best > max) return false; // no cell in this row can still win
+    prev = cur;
+  }
+  return prev[b.length] <= max;
 }
 
 /** The checkpoint the tutor is expected to work next, or null if unknown. */
@@ -1340,23 +1653,37 @@ function tutorAwaitingAnswer(ctx: any): string {
       // A tool-only assistant turn is not the tutor speaking.
       if (!text) continue;
       if (role === "user") return "";
-      const last = (text.split(/\n+/).filter(Boolean).pop() ?? "").trim();
-      // Not only a trailing "?": a live run asked "does that mean your camera's
-      // working now?" and then added "Just so I know for the next paper page."
-      // — so the line ended in a full stop, the guard stayed quiet, and the
-      // picker ate the answer exactly as before. Take the last sentence that
-      // IS a question.
-      // A question the tutor QUOTES is not a question it is waiting on:
-      // `You wrote "is it 6?" earlier.` fired the guard and reported the
-      // fragment `you just asked "You wrote "`. Mask quoted spans (same
-      // length, so offsets still line up) before looking for the "?".
-      const masked = last.replace(/[\u201C"][^\u201D"]*[\u201D"]/g, (m) => " ".repeat(m.length));
-      if (!masked.includes("?")) return "";
-      const end = masked.lastIndexOf("?") + 1;
-      const upTo = last.slice(0, end);
-      const parts = masked.slice(0, end - 1).split(/(?<=[.!?])\s+/);
-      const startAt = parts.length > 1 ? upTo.length - parts[parts.length - 1].length - 1 : 0;
-      return upTo.slice(Math.max(0, startAt)).trim();
+      // The LAST FEW lines, not only the last one. A question followed by a
+      // closing remark is the commonest shape the tutor produces — ch1's
+      // reveal_after scripts it that way in so many words ("THEN one typed
+      // follow-up … Bridge: …") — and looking only at the final line meant the
+      // guard went quiet on exactly the turn it exists for: the picker opened
+      // over an unanswered question, the student's typed reply went into it,
+      // and the checkpoint was logged with nothing of theirs to quote.
+      for (const last of text
+        .split(/\n+/)
+        .filter(Boolean)
+        .map((l: string) => l.trim())
+        .slice(-3)
+        .reverse()) {
+        // Not only a trailing "?": a live run asked "does that mean your camera's
+        // working now?" and then added "Just so I know for the next paper page."
+        // — so the line ended in a full stop, the guard stayed quiet, and the
+        // picker ate the answer exactly as before. Take the last sentence that
+        // IS a question.
+        // A question the tutor QUOTES is not a question it is waiting on:
+        // `You wrote "is it 6?" earlier.` fired the guard and reported the
+        // fragment `you just asked "You wrote "`. Mask quoted spans (same
+        // length, so offsets still line up) before looking for the "?".
+        const masked = last.replace(/[\u201C"][^\u201D"]*[\u201D"]/g, (m) => " ".repeat(m.length));
+        if (!masked.includes("?")) continue;
+        const end = masked.lastIndexOf("?") + 1;
+        const upTo = last.slice(0, end);
+        const parts = masked.slice(0, end - 1).split(/(?<=[.!?])\s+/);
+        const startAt = parts.length > 1 ? upTo.length - parts[parts.length - 1].length - 1 : 0;
+        return upTo.slice(Math.max(0, startAt)).trim();
+      }
+      return "";
     }
   } catch {
     /* a transcript we cannot read never blocks a close */
@@ -1970,6 +2297,17 @@ function parkNote(id: string, markdown: string): void {
   }
 }
 
+/** Drop a parked note once its cell is safely in the notebook. */
+function unparkNote(id: string): void {
+  try {
+    const chapter = sanitize(currentChapterId() || "ch");
+    fs.rmSync(path.join(parkedDir(), `${chapter}--${sanitize(id)}.md`), { force: true });
+  } catch {
+    // A leftover park file is harmless: flushParkedNotes skips a cell that is
+    // already on the page, and the closing summary only lists what is left.
+  }
+}
+
 /**
  * Insert every parked note, oldest first, before anything else goes in.
  * Called at the top of each build so a recovered note lands in its own
@@ -2009,7 +2347,7 @@ async function insertMarkdownCell(
   markdown: string,
   signal?: AbortSignal,
   skipHeader = false,
-): Promise<{ out: string; failed: boolean }> {
+): Promise<{ out: string; failed: boolean; reason?: string }> {
   const warm = await ensureWarm(signal);
   if (warm) return warm;
   // A note recovered from an outage belongs to the chapter it was written
@@ -2189,6 +2527,28 @@ function buildSessionSummary(entries: any[], allCheckpoints: string[]): string {
       out.push(`Typed by the student: ${JSON.stringify(e.student_said_verbatim)}`);
     }
     if (e.notes) out.push(`Tutor's note: ${String(e.notes).trim()}`);
+    // Gaps the guards gave up on. Each of these is written on the row and, up
+    // to now, read by nothing: a checkpoint closed without its figure, without
+    // the page it was about, or by the referee looked exactly like one that
+    // went to plan. The log was honest; every view derived from it was not.
+    if (Array.isArray(e.build_missing) && e.build_missing.length) {
+      out.push(
+        `NOT BUILT: ${e.build_missing.join(", ")} — this checkpoint's figure is ` +
+          `not in the notebook (the notebook was unreachable, or the tutor never ` +
+          `ran the build). The answer below was given without it.`,
+      );
+    }
+    if (e.photo_missing) {
+      out.push(`NO PHOTO: closed without the pen-and-paper page this checkpoint asks for.`);
+    }
+    if (e.closed_by_referee) {
+      out.push(`Closed by referee ruling: ${String(e.closed_by_referee)} (the student appealed).`);
+    }
+    if (e.id_snapped_from) {
+      out.push(
+        `(the tutor sent the id as "${String(e.id_snapped_from)}"; corrected to the script's)`,
+      );
+    }
     // The note quotes the transcript, so a grader never has to trust the
     // tutor's memory. What is worth a human eye is what the note left out.
     if (Array.isArray(e.figures_not_quoted) && e.figures_not_quoted.length) {
@@ -2204,6 +2564,29 @@ function buildSessionSummary(entries: any[], allCheckpoints: string[]): string {
           .join(", ")} (a question they already have a souvenir for, or ` +
           `acknowledgement — the full list above is the record, and worth a ` +
           `glance if one of these looks like part of their answer)`,
+      );
+    }
+    out.push("");
+  }
+  // Appeals are logged (type "appeal") and were read by neither closing
+  // artifact, so a session where the student had to go over the tutor's head
+  // — the one signal that says the tutor was failing them — reached the
+  // grader only if they opened the raw JSONL. Using the button is
+  // participation, and the record should show it as such.
+  const appeals = entries.filter((e: any) => e.type === "appeal");
+  if (appeals.length) {
+    out.push(`## Appeals to the referee (${appeals.length})`);
+    out.push(
+      `The student pressed the ⚖️ box. This counts as participation, never against ` +
+        `them — but it is worth reading, because it is where they felt stuck.`,
+    );
+    for (const a of appeals) {
+      out.push(
+        `- Their case: ${String(a.student_case ?? "").trim()}`,
+        `  Ruling: ${String(a.ruling ?? "?")} — ${String(a.reason ?? "").trim()}` +
+          (a.referee
+            ? ` [${String(a.referee)}]`
+            : " [referee unreachable — the tutor resolved it]"),
       );
     }
     out.push("");
@@ -2331,6 +2714,10 @@ export default function (pi: ExtensionAPI) {
   // resume and then treated as settled: the brief says not to go back for
   // them, so nothing downstream may order it to.
   const resumeGaps = new Set<string>();
+  // How many turns the tutor has spent on the checkpoint it is working now.
+  // Reset by checkpoint_done and chapter_done — see the ⚖️ nudge at turn_end.
+  let turnsInCheckpoint = 0;
+  const STUCK_TURNS = 12;
   // Upload widgets nb_view_image has actually looked at. Cell presence is
   // not evidence that the photo was ASKED for: cp5's script builds the drop
   // area up front, so the area exists from question 1 and a tutor that then
@@ -2424,8 +2811,39 @@ export default function (pi: ExtensionAPI) {
     stopMarimo();
   });
 
+  // Rendered plainly, in the warning colour, because it is the one message in
+  // this whole toolkit written for the student to act on rather than read.
+  pi.registerMessageRenderer("setup-help", (message: any, _opts: any, theme: any) => {
+    const body = String(message.content ?? "")
+      .split("\n")
+      .map((l: string) => theme.fg("warning", l))
+      .join("\n");
+    return new Text(body, 0, 0);
+  });
+
   pi.on("session_start", async (_event, _ctx) => {
     lastCtx = _ctx ?? lastCtx;
+    // Before anything else: is the tutor's own model reachable? A broken key
+    // or a stale endpoint is otherwise discovered as an unexplained
+    // "Connection error." on the student's first hello.
+    void preflightProvider(_ctx).then((problem) => {
+      if (!problem) return;
+      try {
+        // No ui.notify beside this: pi renders a notification as another
+        // "Error:" row, and the student is already looking at one they cannot
+        // read. One block, in plain words, last on the screen.
+        piRef?.sendMessage(
+          {
+            customType: "setup-help",
+            content: `⚠  Your tutor cannot reach the course server.\n\n${problem}`,
+            display: true,
+          },
+          { deliverAs: "followUp" },
+        );
+      } catch {
+        /* best effort — the student still gets pi's own error */
+      }
+    });
     // ── Chapter start + resume brief ──────────────────────────────────────
     // Determine the current chapter (from progress or saved state), inject
     // its script, and — when previous progress exists — a resume brief that
@@ -2572,8 +2990,29 @@ export default function (pi: ExtensionAPI) {
   // Custom compaction at chapter boundaries: the handoff brief IS the summary
   // (deterministic, no extra LLM call).
   let pendingHandoffBrief: string | null = null;
+  // When it was armed. The brief belongs to ONE compaction — the one
+  // chapter_done starts — and every other path that arms it also clears it on
+  // failure, except the 20-second fallback timer, which did not. A brief left
+  // behind there is consumed by the next compaction instead, which may be the
+  // automatic one forty minutes later: the tutor is then handed a summary
+  // saying it has just started chapter 2, in the middle of chapter 3, and the
+  // real conversation is gone. Stale after two minutes, which is far longer
+  // than the handoff takes and far shorter than the session.
+  let handoffArmedAt = 0;
+  const HANDOFF_TTL_MS = 120_000;
+  // Armed by chapter_done, fired at message_end — see the comment there.
+  let pendingCompaction: (() => void | Promise<void>) | null = null;
+  const runPendingCompaction = () => {
+    const go = pendingCompaction;
+    pendingCompaction = null;
+    if (go) void Promise.resolve(go()).catch(() => {});
+  };
   pi.on("session_before_compact", async (event: any) => {
     if (!pendingHandoffBrief) return;
+    if (Date.now() - handoffArmedAt > HANDOFF_TTL_MS) {
+      pendingHandoffBrief = null;
+      return; // let pi summarise this one itself
+    }
     const summary = pendingHandoffBrief;
     pendingHandoffBrief = null;
     return {
@@ -2668,11 +3107,11 @@ export default function (pi: ExtensionAPI) {
       const MORE = "Give me one more practice problem";
       if (ctx?.ui?.select) {
         const title = chapters[idx]?.title ?? "this part";
-        const choice = await ctx.ui.select(`Before we leave "${title}" — anything first?`, [
-          READY,
-          ASK_Q,
-          MORE,
-        ]);
+        const { choice, typed } = await askStudent(
+          ctx,
+          `Before we leave "${title}" — anything first?`,
+          [READY, ASK_Q, MORE],
+        );
         if (choice !== READY) {
           const text =
             choice === ASK_Q
@@ -2684,9 +3123,15 @@ export default function (pi: ExtensionAPI) {
                   `the same kind on NEW data, reusing this module's objects (the 4-person ` +
                   `network, the 8-dot ring) so the numbers stay comparable. Guide, judge, log ` +
                   `it as extra practice (never a fail), then call chapter_done again.`
-                : `The student closed the picker without choosing — they may want to say ` +
-                  `something in their own words. Ask them in plain text what they'd like to do, ` +
-                  `handle it, then call chapter_done again.`;
+                : choice === TYPE_IT && typed
+                  ? `Do NOT advance. The student typed this instead of picking a row — these ` +
+                    `are THEIR words, react to them: "${typed}". Answer whatever it asks (a ` +
+                    `question gets a proper answer, a souvenir cell and log_detour), then ask ` +
+                    `in plain text whether they are ready, and call chapter_done again once ` +
+                    `they say so.`
+                  : `The student closed the picker without choosing — they may want to say ` +
+                    `something in their own words. Ask them in plain text what they'd like to do, ` +
+                    `handle it, then call chapter_done again.`;
           return { content: [{ type: "text" as const, text }], details: { gated: true } };
         }
       } else if ((chapterGateWarned.get(`${chapters[idx]?.id}:pace`) ?? 0) < 1) {
@@ -2751,6 +3196,7 @@ export default function (pi: ExtensionAPI) {
           details: {},
         };
       }
+      turnsInCheckpoint = 0;
       writeChapterState(next.id);
       // Re-arm the build-ordering guard on the new chapter's first
       // checkpoint, so it keeps working across the transition instead of
@@ -2767,6 +3213,7 @@ export default function (pi: ExtensionAPI) {
         `The notebook already contains every cell built so far — never rebuild them. ` +
         `Continue warmly with the same voice; your new CHAPTER SCRIPT message has the curriculum.`;
       pendingHandoffBrief = brief;
+      handoffArmedAt = Date.now();
       // The next chapter must load AFTER compaction: injecting before it
       // races the session reload (the fresh turn gets aborted and nothing
       // restarts — seen in production) and the script could be summarized
@@ -2777,7 +3224,14 @@ export default function (pi: ExtensionAPI) {
       const loadOnce = () => {
         if (loaded) return;
         loaded = true;
-        void insertChapterHeader(next, num, chapters.length);
+        // Any note the notebook was down for goes in BEFORE the next
+        // chapter's heading. A live run killed marimo during cp1_routing;
+        // its note was parked, the chapter turned over, and the recovered
+        // note landed under "── Chapter 2 ──" — a chapter-1 answer filed
+        // inside chapter 2, in the keepsake the student submits. Every
+        // other insertion point already flushes first; this was the one
+        // that did not.
+        void flushParkedNotes().then(() => insertChapterHeader(next, num, chapters.length));
         pi.sendMessage(
           {
             customType: "chapter-divider",
@@ -2795,21 +3249,42 @@ export default function (pi: ExtensionAPI) {
           { deliverAs: "followUp", triggerTurn: true },
         );
       };
-      try {
-        ctx?.compact?.({
-          customInstructions: "chapter handoff",
-          onComplete: loadOnce,
-          onError: () => {
-            pendingHandoffBrief = null;
-            loadOnce();
-          },
-        });
-        const timer = setTimeout(loadOnce, 20_000);
-        (timer as any).unref?.();
-      } catch {
-        pendingHandoffBrief = null;
-        loadOnce();
-      }
+      // Compaction aborts whatever model request is in flight — and the one
+      // in flight right now is the tutor saying the bridge sentence this very
+      // tool result asks for. Started here, it printed a red
+      // "Error: This operation was aborted" into the student's terminal at
+      // every chapter turn, four times a session, with nothing actually
+      // wrong. So it is armed here and fired at message_end, once the tutor
+      // has finished speaking.
+      pendingCompaction = async () => {
+        // Wait for pi to actually settle. turn_end fires while the run is
+        // still winding down, and compacting then aborts it — which the
+        // student reads as "Error: This operation was aborted", in red, at
+        // every chapter boundary. isIdle() is the difference between "the
+        // tutor has stopped talking" and "there is nothing left to abort".
+        for (let i = 0; i < 40 && ctx?.isIdle && !ctx.isIdle(); i++) {
+          await new Promise((r) => setTimeout(r, 250));
+        }
+        try {
+          ctx?.compact?.({
+            customInstructions: "chapter handoff",
+            onComplete: loadOnce,
+            onError: () => {
+              pendingHandoffBrief = null;
+              loadOnce();
+            },
+          });
+          const timer = setTimeout(loadOnce, 20_000);
+          (timer as any).unref?.();
+        } catch {
+          pendingHandoffBrief = null;
+          loadOnce();
+        }
+      };
+      // A floor under it: a tutor that says nothing at all may never produce
+      // a message_end, and a chapter that never loads strands the student.
+      const armed = setTimeout(runPendingCompaction, 30_000);
+      (armed as any).unref?.();
       return {
         content: [
           {
@@ -2822,7 +3297,7 @@ export default function (pi: ExtensionAPI) {
         details: {},
       };
     },
-    ...quietRender,
+    ...quiet("Getting our next chapter ready…"),
   });
 
   // ── Runaway guard ─────────────────────────────────────────────────────────
@@ -2896,17 +3371,31 @@ export default function (pi: ExtensionAPI) {
       judgment: Type.String({
         description: "One of: pass | pass_with_hints | guided | prediction.",
       }),
-      hints_used: Type.Number({ description: "How many hints you gave (0 is fine and normal)." }),
+      // Optional, and accepted as a string too: execute already does
+      // `Number(params.hints_used ?? 0) || 0`, so a missing or "2"-shaped
+      // value costs nothing — while requiring a number meant a model that
+      // sent "2" lost the entire close, including the student's verbatim
+      // answer, to a schema rejection it never sees the text of.
+      hints_used: Type.Optional(
+        Type.Union([Type.Number(), Type.String()], {
+          description: "How many hints you gave (0 is fine and normal).",
+        }),
+      ),
       notes: Type.String({ description: "One line: what their answer showed." }),
+      // A union with String because a small model reliably sends this array
+      // as a JSON string sooner or later, and a schema rejection here loses
+      // the whole close — the log row and the student's own words with it.
+      // Normalised in execute; the shape it asks for is still the array.
       note_slots: Type.Optional(
-        Type.Array(Type.String(), {
+        Type.Union([Type.Array(Type.String()), Type.String()], {
           description:
             "Fills for the «slots» in the script's note: skeleton that a transcript " +
             "cannot supply — what their drawing shows, which option they picked, the " +
-            "numbers a widget displayed. ONE per such slot, in order. Slots marked " +
-            "«… verbatim» are filled with the student's typed words automatically — " +
-            "skip them. Sending fewer than the rest is refused twice, then the " +
-            "unfilled ones print as '(not answered)' in the graded notebook.",
+            "numbers a widget displayed. ONE per such slot, in order, as an array of " +
+            "strings. Slots marked «… verbatim» are filled with the student's typed " +
+            "words automatically — skip them. Sending fewer than the rest is refused " +
+            "twice, then the unfilled ones print as '(not answered)' in the graded " +
+            "notebook.",
         }),
       ),
       note_markdown: Type.Optional(
@@ -2919,7 +3408,12 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, signal, _onUpdate, ctx: any) {
       lastCtx = ctx ?? lastCtx;
-      const id = String(params.id ?? "").trim();
+      // Everything below looks the checkpoint up by this id — the note
+      // skeleton, the build guard, the ordering guard, both closing artifacts.
+      // A near miss is pulled back onto the script rather than quietly
+      // disabling all four (see snapCheckpointId).
+      const snapped = snapCheckpointId(String(params.id ?? "").trim());
+      const id = snapped.id;
       const judgment = String(params.judgment ?? "").trim();
       if (!JUDGMENTS.includes(judgment)) {
         return toResult({
@@ -3097,7 +3591,22 @@ export default function (pi: ExtensionAPI) {
       // was a drawing, a photo or a picker, which no transcript holds. It may
       // still send a fill per slot positionally (older habit, and what the
       // refusal below prints); both shapes are accepted.
-      const givenSlots = (params.note_slots ?? []).map((x: unknown) => String(x ?? ""));
+      // Accepted as an array, or as the JSON string a small model sends when
+      // it forgets the difference, or as one plain fill for a one-slot note.
+      const rawSlots = params.note_slots;
+      const slotList: unknown[] = Array.isArray(rawSlots)
+        ? rawSlots
+        : typeof rawSlots === "string" && rawSlots.trim()
+          ? (() => {
+              try {
+                const parsed = JSON.parse(rawSlots);
+                return Array.isArray(parsed) ? parsed : [rawSlots];
+              } catch {
+                return [rawSlots];
+              }
+            })()
+          : [];
+      const givenSlots = slotList.map((x: unknown) => String(x ?? ""));
       const modelSlotIdx = markers
         .map((m, i) => (/verbatim/i.test(m) ? -1 : i))
         .filter((i) => i >= 0);
@@ -3402,6 +3911,7 @@ export default function (pi: ExtensionAPI) {
         appealRuling = refereeWaiver!.ruling;
         if (appealRuling !== "next_chapter") refereeWaiver = null;
       }
+      turnsInCheckpoint = 0; // a closed checkpoint is not a stuck one
       const logged = appendLog({
         type: "checkpoint",
         id,
@@ -3414,6 +3924,14 @@ export default function (pi: ExtensionAPI) {
         ...(picked.length > 0 ? { student_picked: picked } : {}),
         ...(responseSnappedFrom ? { response_retyped_as: responseSnappedFrom } : {}),
         ...(photoMissing ? { photo_missing: true } : {}),
+        // The build guard gives up after two refusals and logs anyway — the
+        // right call, since a guard that can strand a student is worse than
+        // the fault it catches. But it left no mark, so a row for a checkpoint
+        // whose figure is not in the notebook was byte-identical to an honest
+        // one, while the photo gate beside it has always stamped its own gap.
+        ...(missingBuild.length ? { build_missing: missingBuild } : {}),
+        // Which id the model actually sent, when it was not the script's.
+        ...(snapped.snappedFrom ? { id_snapped_from: snapped.snappedFrom } : {}),
         ...(appealRuling ? { closed_by_referee: appealRuling } : {}),
         ...(quotesSnapped.length ? { slot_quotes_repaired: quotesSnapped } : {}),
         ...(quotesMsgs.length ? { note_quotes_msgs: quotesMsgs } : {}),
@@ -3439,15 +3957,23 @@ export default function (pi: ExtensionAPI) {
           `NO NOTE CELL: this checkpoint has no note: skeleton and you passed no ` +
           `note_markdown — add one now with nb_add_cell (name "${id}_note").`;
       } else {
+        // Park FIRST, unpark on success. The row is already on disk by this
+        // point, and inserting a cell takes a round trip to the kernel — so a
+        // session that ends inside that round trip (Ctrl-C, a closed terminal,
+        // a shut laptop, all of them ordinary ways for a beginner to stop)
+        // left a logged checkpoint whose note existed nowhere: not in the
+        // notebook, not parked, and not in the model's context after the next
+        // compaction. Written down before the risky part, it survives.
         await flushParkedNotes(signal);
+        parkNote(`${id}_note`, md);
         const r = await insertMarkdownCell(`${id}_note`, md, signal);
-        // A note that could not be written is PARKED, exactly as rendered.
+        // A note that could not be written stays PARKED, exactly as rendered.
         // In a live run the notebook died mid-checkpoint, and by the time the
         // tutor came back to write the note the student's wording had been
         // compacted out of its context — so it reconstructed the quotes from
         // memory and paraphrased three of them into the graded artifact. The
         // text is already correct here; nothing needs to remember it.
-        if (r.failed) parkNote(`${id}_note`, md);
+        if (!r.failed) unparkNote(`${id}_note`);
         noteLine = r.failed
           ? `Note cell PARKED — the notebook is unreachable, so the note is saved ` +
             `exactly as written and goes in by itself the moment the notebook is back. ` +
@@ -3492,7 +4018,7 @@ export default function (pi: ExtensionAPI) {
       let paceAsked = false;
       if (ctx?.ui?.select) {
         paceAsked = true;
-        const choice = await ctx.ui.select("Where to next?", [READY, ASK_Q, MORE]);
+        const { choice, typed } = await askStudent(ctx, "Where to next?", [READY, ASK_Q, MORE]);
         const practiceRound = /_extra/.test(id);
         nextLine =
           choice === READY
@@ -3516,8 +4042,14 @@ export default function (pi: ExtensionAPI) {
                       `problem of the same kind on NEW data, from this checkpoint's ` +
                       `fresh_variants. Guide, then checkpoint_done again with id ` +
                       `"${baseCheckpointId(id)}_extra" (never a fail). After that: ${goNext}`
-                : `The student closed the picker — ask in plain text what they'd like to do. ` +
-                  `If they want to move on: ${goNext}`;
+                : choice === TYPE_IT && typed
+                  ? `Do NOT start the next checkpoint. The student typed this instead of ` +
+                    `picking a row — these are THEIR words, react to them: "${typed}". ` +
+                    `Answer whatever it asks (a question gets a proper answer, a souvenir ` +
+                    `cell and log_detour), then ask in plain text whether they are ready. ` +
+                    `Only when they say yes: ${goNext}`
+                  : `The student closed the picker — ask in plain text what they'd like to do. ` +
+                    `If they want to move on: ${goNext}`;
       }
 
       if (!paceAsked && nextId) paceUnasked.add(nextId);
@@ -3528,7 +4060,7 @@ export default function (pi: ExtensionAPI) {
         failed: false,
       });
     },
-    ...quietRender,
+    ...quiet("Writing that into your notebook…"),
   });
 
   // ── log_detour ────────────────────────────────────────────────────────────
@@ -3715,16 +4247,28 @@ export default function (pi: ExtensionAPI) {
       const gapKey = cellName || question;
       if (gap && (detourTextOnlyWarned.get(gapKey) ?? 0) < 2) {
         detourTextOnlyWarned.set(gapKey, (detourTextOnlyWarned.get(gapKey) ?? 0) + 1);
+        // "Fix it with nb_edit_cell" is the right advice for a cell that is
+        // there and thin. For a cell that does not exist it is impossible
+        // advice: nb_edit_cell cannot create one, so it prints "no cell named
+        // X", which renders as a ✓, and the model tries again against the
+        // same nothing until the strikes run out.
+        const missing = gap === "does not exist in the notebook";
         return toResult({
-          out:
-            `NOT LOGGED YET — the souvenir cell "${cellName}" ${gap}. Fix it with ` +
-            `nb_edit_cell so it holds something to see or try (their question is ` +
-            `quoted for you, you do not need to add it) —\n` +
-            `  mo.vstack([mo.md(r"""> 🧭 **You asked:** “…”\n\n…"""), netviz(edges, highlight=[…])])\n` +
-            `— or an nb_add_exercise box if the idea is playable. Then call log_detour ` +
-            `again with the same cell_name.\n` +
-            `If words genuinely are the whole answer here, call log_detour again as it ` +
-            `is and it will be accepted.`,
+          out: missing
+            ? `NOT LOGGED YET — there is no cell named "${cellName}" in the notebook. ` +
+              `nb_edit_cell cannot make one; build it first with nb_add_cell (name ` +
+              `"${cellName}"), text and picture in ONE cell —\n` +
+              `  mo.vstack([mo.md(r"""> 🧭 **You asked:** “…”\n\n…"""), netviz(edges, highlight=[…])])\n` +
+              `— or an nb_add_exercise box if the idea is playable. Then call log_detour ` +
+              `again with the same cell_name.`
+            : `NOT LOGGED YET — the souvenir cell "${cellName}" ${gap}. Fix it with ` +
+              `nb_edit_cell so it holds something to see or try (their question is ` +
+              `quoted for you, you do not need to add it) —\n` +
+              `  mo.vstack([mo.md(r"""> 🧭 **You asked:** “…”\n\n…"""), netviz(edges, highlight=[…])])\n` +
+              `— or an nb_add_exercise box if the idea is playable. Then call log_detour ` +
+              `again with the same cell_name.\n` +
+              `If words genuinely are the whole answer here, call log_detour again as it ` +
+              `is and it will be accepted.`,
           failed: false,
         });
       }
@@ -3775,7 +4319,14 @@ export default function (pi: ExtensionAPI) {
       if (!md0) {
         return toResult({
           out: cellName
-            ? `Logged. Souvenir cell "${cellName}" noted.`
+            ? // Do not call a cell that is not there "noted": the give-up path
+              // reported success for a souvenir the student's notebook does
+              // not contain, and the model moved on satisfied.
+              gap === "does not exist in the notebook"
+              ? `Logged — but there is still NO cell named "${cellName}" in the notebook, ` +
+                `so this detour has no souvenir. Build it with nb_add_cell (not ` +
+                `nb_edit_cell, which cannot create a cell) when you get a moment.`
+              : `Logged. Souvenir cell "${cellName}" noted.`
             : `Logged — but NO souvenir cell yet. Add one now (nb_add_cell, name ` +
               `"detour_<topic>"): their question quoted plus the idea, text and picture ` +
               `together in ONE cell (mo.vstack + netviz).`,
@@ -3789,7 +4340,7 @@ export default function (pi: ExtensionAPI) {
         failed: false,
       });
     },
-    ...quietRender,
+    ...quiet("Keeping a note of your question…"),
   });
 
   // ── nb_add_cell ───────────────────────────────────────────────────────────
@@ -3822,9 +4373,22 @@ export default function (pi: ExtensionAPI) {
       await flushParkedNotes(signal);
       await ensureChapterHeader(signal);
       const hide = params.show_code === true ? "False" : "True";
+      // nb_add_exercise and nb_view_image both validate the name; this one did
+      // not, and it is the tool that gets hand-written names — detours,
+      // souvenirs, the personalised half of the notebook. marimo stores a cell
+      // whose name is not an identifier as an unparsable block, so "detour:
+      // clustering" becomes a dead region in the keepsake and neither
+      // nb_edit_cell nor nb_delete_cell can address it afterwards. Correct it
+      // rather than refuse, and say what it became.
+      const wanted = String(params.name ?? "").trim();
+      const name = /^[A-Za-z_]\w*$/.test(wanted)
+        ? wanted
+        : sanitize(wanted)
+            .replace(/^(?=\d)/, "c_")
+            .replace(/^_+$/, "cell") || "cell";
       let inner =
         `async with cm.get_context() as ctx:\n` +
-        `    _cid = ctx.create_cell(_code, name=${py(params.name)}, hide_code=${hide})\n` +
+        `    _cid = ctx.create_cell(_code, name=${py(name)}, hide_code=${hide})\n` +
         `    ctx.run_cell(_cid)\n`;
       inner += focusCellCode("_cid", "    ");
       // Improvised cells go through the review (nb_review.py) — it catches the
@@ -3836,10 +4400,10 @@ export default function (pi: ExtensionAPI) {
       // the model cannot satisfy must never be able to strand the student
       // in a retry loop; a cell with one bad formula is the smaller harm,
       // and nb_edit_cell can still fix it.
-      const strikes = cellReviewWarned.get(params.name) ?? 0;
+      const strikes = cellReviewWarned.get(name) ?? 0;
       const enforce = review && strikes < 2;
-      if (review && !enforce) cellReviewWarned.delete(params.name);
-      else if (review) cellReviewWarned.set(params.name, strikes + 1);
+      if (review && !enforce) cellReviewWarned.delete(name);
+      else if (review) cellReviewWarned.set(name, strikes + 1);
       const code =
         `import marimo._code_mode as cm\n` +
         (review ? review + "\n" : "") +
@@ -3859,10 +4423,17 @@ export default function (pi: ExtensionAPI) {
                 `"Fix it with nb_edit_cell rather than retrying.")\n`)
           : inner);
       const addCellResult = await runKernel(code, signal);
-      if (!addCellResult.failed) await pinAppealToBottom(signal);
+      if (!addCellResult.failed) {
+        await pinAppealToBottom(signal);
+        if (name !== wanted) {
+          addCellResult.out +=
+            `\nNAMED "${name}" — "${wanted}" is not a usable cell name (marimo needs a ` +
+            `Python identifier). Use "${name}" if you refer to this cell later.`;
+        }
+      }
       return toResult(addCellResult);
     },
-    ...quietRender,
+    ...quiet("Adding something to your whiteboard…"),
   });
 
   // ── nb_add_exercise ───────────────────────────────────────────────────────
@@ -4081,7 +4652,7 @@ export default function (pi: ExtensionAPI) {
       }
       return toResult(result);
     },
-    ...quietRender,
+    ...quiet("Setting up a box for you to try…"),
   });
 
   // ── nb_add_template ───────────────────────────────────────────────────────
@@ -4223,7 +4794,7 @@ export default function (pi: ExtensionAPI) {
       }
       return toResult(result);
     },
-    ...quietRender,
+    ...quiet("Putting something on your whiteboard…"),
   });
 
   // ── nb_fresh_start ────────────────────────────────────────────────────────
@@ -4386,7 +4957,7 @@ export default function (pi: ExtensionAPI) {
       }
       return toResult(result);
     },
-    ...quietRender,
+    ...quiet("Clearing the whiteboard for a fresh start…"),
   });
 
   // ── nb_edit_cell ──────────────────────────────────────────────────────────
@@ -4417,7 +4988,7 @@ export default function (pi: ExtensionAPI) {
         `        ctx.run_cell(${py(params.name)})\n`;
       return toResult(await runKernel(code, signal));
     },
-    ...quietRender,
+    ...quiet("Tidying something on your whiteboard…"),
   });
 
   // ── nb_delete_cell ────────────────────────────────────────────────────────
@@ -4433,18 +5004,46 @@ export default function (pi: ExtensionAPI) {
       names: Type.Array(Type.String(), { description: "Cell names to delete." }),
     }),
     async execute(_id, params, signal) {
+      // "Never delete a cell holding a student's answer" lived only in the
+      // description above, and a model whose cell came out wrong reaches for
+      // delete-and-rebuild by reflex. The cells that reflex reaches for are
+      // the ones that cannot be rebuilt: a note cell quotes words that, after
+      // compaction, are no longer anywhere in the model's context; a _view
+      // cell is the only copy of the photograph inside the notebook; an _ed
+      // cell is the code the student wrote. All three are the graded artifact.
+      const names: string[] = Array.isArray(params.names) ? params.names.map(String) : [];
+      const PROTECTED = /(_note|_view|_photo|_ed|_out|_sent|_header)$|^session_record$/;
+      const refused = names.filter((n) => PROTECTED.test(n));
+      const allowed = names.filter((n) => !PROTECTED.test(n));
+      if (refused.length && !allowed.length) {
+        return toResult({
+          failed: false,
+          out:
+            `NOT DELETED — ${refused.map((n) => `"${n}"`).join(", ")} ${refused.length > 1 ? "hold" : "holds"} ` +
+            `the student's own work (their answer, their photo, or their code) and ` +
+            `${refused.length > 1 ? "are" : "is"} part of what gets graded. Nothing was ` +
+            `deleted. If the content is wrong, fix it with nb_edit_cell — and if it is a ` +
+            `note cell, leave it alone: checkpoint_done wrote it from the transcript.`,
+        });
+      }
       const code =
         `import marimo._code_mode as cm\n` +
         `async with cm.get_context() as ctx:\n` +
         `    _names = [c.name for c in ctx.cells]\n` +
-        `    for _n in ${pyList(params.names)}:\n` +
+        `    for _n in ${pyList(allowed)}:\n` +
         `        if _n in _names:\n` +
         `            ctx.delete_cell(_n)\n` +
         `        else:\n` +
         `            print("skip: no cell named", _n)\n`;
-      return toResult(await runKernel(code, signal));
+      const r = await runKernel(code, signal);
+      if (refused.length && !r.failed) {
+        r.out +=
+          `\nKEPT: ${refused.map((n) => `"${n}"`).join(", ")} — the student's own work is ` +
+          `never deleted. Use nb_edit_cell if one of them needs a correction.`;
+      }
+      return toResult(r);
     },
-    ...quietRender,
+    ...quiet("Clearing something off the whiteboard…"),
   });
 
   // ── nb_read ───────────────────────────────────────────────────────────────
@@ -4470,7 +5069,7 @@ export default function (pi: ExtensionAPI) {
         `        print(_e, "!", type(_ex).__name__, str(_ex))\n`;
       return toResult(await runKernel(code, signal));
     },
-    ...quietRender,
+    ...quiet("Having a look at your notebook…"),
   });
 
   // ── nb_view_image ─────────────────────────────────────────────────────────
@@ -4638,7 +5237,7 @@ export default function (pi: ExtensionAPI) {
         failed: false,
       });
     },
-    ...quietRender,
+    ...quiet("Looking at your photo…"),
   });
 
   // ── nb_run ────────────────────────────────────────────────────────────────
@@ -4672,7 +5271,7 @@ export default function (pi: ExtensionAPI) {
       }
       return toResult(result);
     },
-    ...quietRender,
+    ...quiet("One moment…"),
   });
 
   // ── waiting-time trivia ───────────────────────────────────────────────────
@@ -4688,31 +5287,80 @@ export default function (pi: ExtensionAPI) {
   // (cp6), and no "high clustering AND short paths" definition (cp5_tension,
   // cp7). Context and history are fine; answers are not.
   const TRIVIA = [
+    // — where the mathematics came from —
     "Euler invented network theory in 1736 to settle a stroll — the 7 bridges of Königsberg.",
     "Two of Königsberg's seven bridges were lost in 1944, and the puzzle's answer changed with them.",
+    "Euler filed his bridge paper under 'geometry of position' — geometry with the distances thrown away.",
+    "Königsberg is Kaliningrad now; the city changed its name, and the puzzle kept his.",
+    "Leonhard Euler wrote roughly 850 papers — and kept publishing after going blind.",
+    "Cayley counted trees in 1889 for the chemists, who wanted to know how many molecules were possible.",
+    "The word 'graph' for a network comes from Sylvester, 1878 — borrowed from chemistry diagrams.",
+    "The four-colour theorem, 1976, was the first famous proof a computer helped finish. It's about a graph.",
+    "Every network ever drawn has an even number of odd-degree dots. Nobody has found an exception.",
+    "Graph isomorphism — are these two drawings the same network? — still has no known fast algorithm.",
+    "Thirty people allow more possible friendship patterns than the universe has atoms.",
+    // — the small-world question, before anyone measured it —
     "Frigyes Karinthy dreamed up the question behind this whole module in a 1929 short story, 'Chains'.",
+    "J. A. Barnes coined 'social network' in 1954, studying a fishing parish in Norway.",
+    "Pool and Kochen wrote the small-world problem down around 1958; it sat unpublished for twenty years.",
     "Stanley Milgram ran his letter experiment out of Harvard in the 1960s, with paper and stamps.",
+    "Milgram's first packets went out from Wichita, Kansas, before he moved the experiment to Omaha.",
+    "Milgram's small-world paper ran in the very first issue of Psychology Today, in 1967.",
+    "Most of Milgram's packets never arrived at all — the famous result rests on the ones that did.",
+    "In Milgram's Boston study, one clothing merchant handed over a quarter of the letters that arrived.",
+    "Milgram's other field experiment: drop stamped letters in the street and see which strangers post them.",
     "In 2003 a team reran Milgram's experiment by email: 24,163 chains, 18 targets, 166 countries.",
-    "Your friends have more friends than you do, on average — the friendship paradox.",
+    // — 1998 and the model —
     "Watts & Strogatz published their network model in Nature in 1998; it has been cited over 50,000 times.",
+    "That 1998 Nature paper is three pages long, figures included.",
+    "Duncan Watts came to networks from crickets — he was studying how they chirp in sync.",
     "The original three networks studied in 1998: film actors, the US power grid, and a worm's brain.",
     "The C. elegans worm's entire nervous system is mapped — all 302 neurons of it.",
+    "A fruit fly's whole brain was mapped in 2024: about 140,000 neurons, 50 million connections.",
+    "Complete wiring maps exist for a worm, a fly, and one cubic millimetre of mouse cortex. That's the list.",
+    "Neuroscience calls the brain's wiring diagram a connectome — network science, with wetware.",
+    // — the karate club —
     "Zachary's karate club split in two in 1977 — and became network science's favorite dataset.",
+    "Zachary sat and watched that club argue for two years. The dataset is field notes.",
+    "Zachary's own method called the split almost perfectly: one member ended up on the wrong side.",
     "Find the karate-club split at a network conference and you can win an actual trophy.",
+    // — Erdős, Bacon, and counting your distance to people —
     "Erdős number: your coauthor distance to Paul Erdős, who has number 0 and 500-odd coauthors.",
+    "About 11,000 people have Erdős number 2, and most of them never met him.",
+    "Paul Erdős owned almost nothing and lived out of a suitcase, in other mathematicians' spare rooms.",
+    "In Erdős's private vocabulary, a mathematician who stopped working had 'died'; one who died had 'left'.",
+    "Erdős and Rényi's 1959 random graph — throw every link in at random — is still the field's null model.",
     "Erdős number + Bacon number = the Erdős–Bacon number. Natalie Portman has one.",
     "Kevin Bacon isn't Hollywood's center — hundreds of actors are better connected.",
+    "Three college students invented the Kevin Bacon game in 1994, after watching Footloose.",
+    "The Oracle of Bacon has been computing actor distances on the web since 1996.",
+    // — how sociologists got here —
     "Granovetter, 1973: people find jobs through acquaintances, not close friends. Weak ties win.",
+    "That weak-ties paper was rejected in 1969. It is now one of the most cited in all of sociology.",
     "Triadic closure: your friend's friend tends to become your friend. That's where triangles come from.",
-    "Leonhard Euler wrote roughly 850 papers — and kept publishing after going blind.",
+    "Moreno drew the first social network by hand in 1933; the New York Times covered it.",
+    "Moreno's first sociograms were drawn to explain a wave of runaways at a girls' reform school.",
+    "Network scientists call a network's own map of itself a 'sociogram' — Moreno's word, still in use.",
+    "Bavelas wired lab groups as a circle, a chain or a star in the 1940s, then timed them solving puzzles.",
+    "Freeman formalised betweenness in 1977: how often you sit on other people's routes.",
+    "Anatol Rapoport was modelling how rumours travel along acquaintance chains in the 1950s.",
+    "Your friends have more friends than you do, on average — the friendship paradox.",
+    "Dunbar's number: human brains manage roughly 150 stable relationships.",
+    "You personally know about 0.000002% of the people alive today.",
+    // — networks that run the modern world —
     "The web, citation networks, and Hollywood all share one shape: a few superstar hubs.",
     "Hub networks shrug off random failures — but fall fast to targeted attacks on hubs.",
-    "Dunbar's number: human brains manage roughly 150 stable relationships.",
+    "Barabási and Albert, 1999: hubs come from growth plus the rich getting richer.",
+    "That rich-get-richer idea is older than the web: Yule in 1925, Simon in 1955, Price in 1965.",
+    "Merton named it the Matthew effect in 1968 — credit flows to whoever already has some.",
     "PageRank is network centrality: where an endlessly clicking web surfer ends up.",
-    "You personally know about 0.000002% of the people alive today.",
-    "The word 'graph' for a network comes from Sylvester, 1878 — borrowed from chemistry diagrams.",
-    "Moreno drew the first social network by hand in 1933; the New York Times covered it.",
-    "Network scientists call a network's own map of itself a 'sociogram' — Moreno's word, still in use.",
+    "PageRank's imaginary surfer gets bored about 15% of the time and jumps to a page at random.",
+    "Stanford owned the PageRank patent, not Google. Google licensed it and paid in shares.",
+    "The ARPANET opened in 1969 with four nodes: UCLA, SRI, UC Santa Barbara and Utah.",
+    "A follow graph is directed: on Twitter, most friendships only point one way.",
+    "Epidemiologists model outbreaks on contact networks, not on crowds of interchangeable people.",
+    "Dot and line, vertex and edge, actor and tie, site and bond — four fields, one picture.",
+    "This notebook is a network too: marimo links each cell to the ones it feeds, and re-runs those.",
   ];
   let triviaIdx = Math.floor(Math.random() * TRIVIA.length);
   let triviaTimer: ReturnType<typeof setInterval> | null = null;
@@ -4736,6 +5384,48 @@ export default function (pi: ExtensionAPI) {
     if (triviaTimer) {
       clearInterval(triviaTimer);
       triviaTimer = null;
+    }
+    // chapter_done arms compaction and leaves the firing to us. It has to be
+    // turn_end, not message_end: message_end lands as soon as the tool-calling
+    // message is complete, which is BEFORE the tutor says the bridge sentence
+    // that same tool result asks for — so compaction aborted it and the
+    // student read "Error: This operation was aborted" instead. A turn ends
+    // once the tutor has actually stopped talking.
+    runPendingCompaction();
+    // ── Telling the student the ⚖️ box exists ────────────────────────────
+    // The appeal box is the student's only way out from under a tutor that
+    // has stopped helping, and nothing ever mentions it to them: AGENTS.md
+    // tells the tutor how to OBEY a verdict and never to offer one, the
+    // lesson scripts do not name it, and in the notebook it is a collapsed
+    // accordion at the bottom of a long page. A beginner going round the
+    // same question for the fifth time does not know it is there.
+    //
+    // "Going round" is countable without asking the model to notice: turns
+    // spent inside one checkpoint. A checkpoint normally takes a handful; a
+    // dozen means the two of them are stuck, whatever the tutor believes.
+    // Said once per checkpoint, as an instruction to mention it in passing —
+    // not as an accusation, and not as a reason to stop teaching.
+    turnsInCheckpoint += 1;
+    if (turnsInCheckpoint === STUCK_TURNS) {
+      try {
+        pi.sendMessage(
+          {
+            customType: "stuck-nudge",
+            content:
+              `NOTE (invisible to the student): you have been on this checkpoint for a ` +
+              `while. Keep going exactly as you are — but in your NEXT message, add one ` +
+              `plain sentence telling them the ⚖️ box at the bottom of the notebook page ` +
+              `is there if they think their answer should count, want a fresh try, or ` +
+              `would rather move on, and that using it is never held against them. One ` +
+              `sentence, said once, then carry on with the question you are on. Do not ` +
+              `apologise and do not suggest they are failing.`,
+            display: false,
+          },
+          { deliverAs: "nextTurn" },
+        );
+      } catch {
+        /* a nudge that cannot be sent is not worth a broken turn */
+      }
     }
   });
 }
