@@ -19,7 +19,7 @@
  * else the student explores (sliders, widgets) has no button — they say so
  * in the terminal and the tutor reads the values with nb_read.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -982,6 +982,20 @@ async function handleAppeal(pi: any): Promise<void> {
           `when photographing is a hardship; honest reasoning deserves credit; extra ` +
           `practice is never failure. Rules serve the student — where a rule's letter ` +
           `and the student's legitimate progress conflict, side with the student.\n\n` +
+          // The six rulings below all decide a CHECKPOINT, and an appeal is not
+          // always about one. A student appealed because the tutor would not
+          // hand their work in to GitHub; the referee had no ruling for that,
+          // ruled on the nearest checkpoint instead, and the tutor accepted the
+          // ruling and moved on — the request itself was never granted. The
+          // directive is the channel for anything the rulings do not name.
+          `WHAT THE TUTOR CAN ACTUALLY DO, so you do not rule around it: it builds and ` +
+          `edits notebook cells, reads what the student typed into a widget, looks at an ` +
+          `uploaded photo, logs checkpoints and detours, and HANDS THE WORK IN — it has ` +
+          `an nb_submit tool that commits and pushes their notebook and session log to ` +
+          `their GitHub repository, and it may use it at any point, not only at the end. ` +
+          `If the appeal is a REQUEST the tutor refused or dropped rather than a dispute ` +
+          `about a checkpoint, rule "keep_going" and make the directive the action: name ` +
+          `the tool and say to do it now, before anything else.\n\n` +
           `THE STUDENT'S CASE (verbatim):\n${caseText}\n\n` +
           `PROGRESS SO FAR (graded log):\n${progressBrief(readSessionLog())}\n\n` +
           `CURRENT CHAPTER SCRIPT (the tutor's curriculum for right now):\n` +
@@ -1087,6 +1101,16 @@ async function handleAppeal(pi: any): Promise<void> {
             `referee's decision): ${verdict.to_student}\n`
           : "") +
         `What you do now, exactly: ${verdict.directive}\n` +
+        // Accepting a ruling is not carrying it out. A student appealed
+        // because the tutor would not hand their work in; the tutor accepted
+        // the verdict warmly, said nothing more about it, and moved on to the
+        // next chapter with the request never granted. Whatever the ruling
+        // names, the thing the student ASKED for is still owed.
+        `And whatever the ruling says, THEIR ORIGINAL REQUEST IS STILL OWED. Agreeing ` +
+        `with the referee is not doing the thing: if they asked for their work to be ` +
+        `handed in, call nb_submit; if they asked for another problem, set one. Do it in ` +
+        `this turn, before you move on, and never advance a chapter with their request ` +
+        `still unanswered.\n` +
         `Do not argue with or re-litigate the ruling, and never hold the appeal ` +
         `against the student — appealing is participation. The appeal itself is ` +
         `already in the log; close any affected checkpoint honestly (its row is ` +
@@ -3341,9 +3365,15 @@ export default function (pi: ExtensionAPI) {
             {
               type: "text" as const,
               text:
-                `That was the FINAL chapter. ${done}Nothing to write yourself — just say ` +
-                `goodbye: tell them plainly what they can now do, that their answers (not ` +
-                `code) are what gets reviewed, and that the notebook is theirs to keep and ` +
+                `That was the FINAL chapter. ${done}\n` +
+                // The last thing a finished session must do is hand itself in.
+                // This used to end at "say goodbye" and nothing anywhere told
+                // the student to submit — a whole module could be finished,
+                // closed and left sitting in a folder, ungraded.
+                `NOW CALL nb_submit — that hands their work in, and it is the last thing ` +
+                `this session owes them. Then say goodbye: tell them plainly what they ` +
+                `can now do, that their answers (not code) are what gets reviewed, that ` +
+                `their work is handed in, and that the notebook is theirs to keep and ` +
                 `keep playing with.`,
             },
           ],
@@ -4330,6 +4360,171 @@ export default function (pi: ExtensionAPI) {
       });
     },
     ...quiet("Writing that into your notebook…"),
+  });
+
+  // ── nb_submit ─────────────────────────────────────────────────────────────
+  //
+  // Handing the work in, from inside the session.
+  //
+  // This did not exist, and its absence cost a student their submission. They
+  // asked the tutor mid-session to put their work on GitHub; the tutor has no
+  // shell and no instruction covering it, so it refused. They appealed to the
+  // referee, which has six rulings and none of them is "submit" — so it ruled
+  // on the nearest thing, the tutor accepted the ruling warmly, and the
+  // session moved on to the next chapter with the request simply gone. The
+  // work sat unsubmitted in a folder.
+  //
+  // There is a second half nobody would have found by reading the module:
+  // these assignments are `submission_mode: "tag"`, where a plain `git push`
+  // is DELIBERATELY not a submission — classroom50 suppresses branch-triggered
+  // runs and grades only a pushed `submit/*` tag. The README told students to
+  // push the branch. So even a student who did it by hand, exactly as
+  // documented, was not handing anything in. Both halves are why this tool
+  // tags as well as pushes.
+  //
+  // git is run directly, never through a shell: the tutor's bash tool is
+  // excluded on purpose, and on Windows the student has Git Bash but the
+  // agent does not.
+  const gitRun = (
+    args: string[],
+    opts: { input?: string } = {},
+  ): { ok: boolean; out: string } => {
+    try {
+      const r = spawnSync("git", args, {
+        cwd: process.cwd(),
+        encoding: "utf-8",
+        input: opts.input,
+        timeout: 120_000,
+        // No credential prompt may ever block the session waiting on a
+        // terminal the student is not looking at.
+        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      });
+      const out = `${r.stdout ?? ""}${r.stderr ?? ""}`.trim();
+      return { ok: r.status === 0, out };
+    } catch (e: any) {
+      return { ok: false, out: String(e?.message ?? e) };
+    }
+  };
+
+  /** `submit/<UTC>-<short sha>` — classroom50's canonical namespace, minted
+   *  the same way its own workflow mints it, so a pushed tag IS the record. */
+  const submissionTag = (sha: string): string => {
+    const t = new Date().toISOString().replace(/\.\d+Z$/, "Z").replace(/:/g, "-");
+    return `submit/${t}-${sha.slice(0, 7)}`;
+  };
+
+  pi.registerTool({
+    name: "nb_submit",
+    label: "Hand in",
+    description:
+      "Commit the student's work and hand it in. Call this WHENEVER they ask to submit, " +
+      "hand in, save to GitHub, or push — at any point in the session, not only at the " +
+      "end — and once more when the module finishes. Never refuse the request and never " +
+      "tell them to type git commands: this is the tool for it. It commits everything " +
+      "(the notebook, the session log, their photos and code), pushes, and then pushes a " +
+      "submission tag, which is what actually starts the grading. Safe to call twice; " +
+      "with nothing new to commit it just says so.",
+    promptSnippet: "Commit and hand in the student's work",
+    parameters: Type.Object({
+      status: STATUS_PARAM,
+      message: Type.Optional(
+        Type.String({
+          description:
+            "Commit message. Something plain about where they are — " +
+            "\"Pair Notebook 01 — through chapter 3\". Defaults to the module and the date.",
+        }),
+      ),
+    }),
+    execute: async (_id: any, params: any, _signal: any, _onUpdate: any) => {
+      const inside = gitRun(["rev-parse", "--is-inside-work-tree"]);
+      if (!inside.ok) {
+        return toResult({
+          out:
+            `NOT HANDED IN — this folder is not a git repository, so there is nothing to ` +
+            `push to. Their work is still safe on disk (the notebook and ` +
+            `session_artifacts/ are written as you go). Tell them plainly that the ` +
+            `folder they are working in is not the one the assignment link created, and ` +
+            `that their instructor can sort it out — then carry on teaching.`,
+          failed: false,
+        });
+      }
+
+      const msg =
+        String(params?.message ?? "").trim() ||
+        `Pair Notebook — ${new Date().toISOString().slice(0, 10)}`;
+
+      gitRun(["add", "-A"]);
+      const staged = gitRun(["diff", "--cached", "--quiet"]);
+      let committed = false;
+      if (!staged.ok) {
+        let c = gitRun(["commit", "-m", msg]);
+        if (!c.ok && /please tell me who you are|user\.email|user\.name/i.test(c.out)) {
+          // A fresh machine has no git identity, and "Please tell me who you
+          // are" is not something to hand a student mid-lesson. Commit as the
+          // repo's own owner, the way GitHub's web editor does.
+          const url = gitRun(["remote", "get-url", "origin"]).out;
+          const owner = /[/:]([^/]+)\/[^/]+?(?:\.git)?$/.exec(url)?.[1] ?? "student";
+          c = gitRun([
+            "-c", `user.name=${owner}`,
+            "-c", `user.email=${owner}@users.noreply.github.com`,
+            "commit", "-m", msg,
+          ]);
+        }
+        if (!c.ok) {
+          return toResult({
+            out:
+              `NOT HANDED IN — the commit failed: ${c.out.slice(0, 300)}\n` +
+              `Say in one warm line that you could not hand it in and their instructor ` +
+              `will sort it out. Their work is still on disk. Then carry on teaching.`,
+            failed: false,
+          });
+        }
+        committed = true;
+      }
+
+      const sha = gitRun(["rev-parse", "HEAD"]).out.trim();
+      const branch = gitRun(["rev-parse", "--abbrev-ref", "HEAD"]).out.trim() || "HEAD";
+      const hasRemote = gitRun(["remote", "get-url", "origin"]).ok;
+      if (!hasRemote) {
+        return toResult({
+          out:
+            `Committed${committed ? "" : " (nothing new to commit)"}, but NOT handed in: ` +
+            `this folder has no GitHub remote, so there is nowhere to push. Tell them ` +
+            `their work is saved here and their instructor can sort the hand-in out.`,
+          failed: false,
+        });
+      }
+
+      const push = gitRun(["push", "origin", `HEAD:${branch}`]);
+      if (!push.ok) {
+        return toResult({
+          out:
+            `Committed, but the push failed: ${push.out.slice(0, 300)}\n` +
+            `Their work IS saved and committed — nothing is lost. Say in one line that ` +
+            `you could not reach GitHub and they should tell their instructor, then carry ` +
+            `on teaching. Do not debug it with them and do not ask them to type anything.`,
+          failed: false,
+        });
+      }
+
+      // The tag is the submission. Without it a push in tag mode is filed and
+      // never graded, which is the failure this whole tool exists for.
+      const tag = submissionTag(sha);
+      const madeTag = gitRun(["tag", tag]).ok && gitRun(["push", "origin", tag]).ok;
+
+      return toResult({
+        out:
+          `Handed in.${committed ? "" : " (Nothing new to commit — pushed what was there.)"} ` +
+          (madeTag
+            ? `Submission tag ${tag} pushed, which is what starts the grading.`
+            : `WARNING: the push worked but the submission tag did not, so this may not ` +
+              `be graded — tell them to mention it to their instructor.`) +
+          `\nSay it in ONE short line — "that's handed in" — and go straight back to the ` +
+          `lesson. They can carry on and hand in again as often as they like.`,
+        failed: false,
+      });
+    },
+    ...quiet("Handing your work in…"),
   });
 
   // ── log_detour ────────────────────────────────────────────────────────────
