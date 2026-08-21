@@ -3518,7 +3518,17 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       status: STATUS_PARAM,
       id: Type.String({ description: "Checkpoint id from the script, e.g. 'cp2_distance'." }),
-      question: Type.String({ description: "The question as you actually asked it." }),
+      // "As you asked it", not "as the script wrote it". A student who
+      // answers a later question early is answering one you never put, and a
+      // row that lists both reads back as a tutor firing two questions in one
+      // breath — which is what a reviewer concluded from exactly this row,
+      // from the log alone, with the transcript already gone.
+      question: Type.String({
+        description:
+          "The question as you actually asked it — not the script's wording, and " +
+          "not a question you skipped because they answered it early. Say in notes " +
+          "when they volunteered the rest.",
+      }),
       student_response: Type.String({
         description: "Their answer VERBATIM — their words, not your summary.",
       }),
