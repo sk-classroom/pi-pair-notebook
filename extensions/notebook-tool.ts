@@ -1308,6 +1308,16 @@ function lastTutorLine(ctx: any, maxChars = 150): string {
       const pair = `${parts[parts.length - 2]} ${line}`;
       if (pair.length <= maxChars) line = pair;
     }
+    // The transcript renders markdown; a select() title does not. Straight out
+    // of the tutor's mouth the line reads "an **Eulerian trail**, and coming
+    // home makes it an **Eulerian circuit**" — asterisks and all, printed at a
+    // student, which is the same fault as saying "$G = (V,E)" out loud.
+    line = line
+      .replace(/\*\*([^*]+)\*\*/g, "$1")
+      .replace(/(^|\s)\*([^*]+)\*(?=\s|[.,!?;:]|$)/g, "$1$2")
+      .replace(/`([^`]+)`/g, "$1")
+      .replace(/(^|\s)_([^_]+)_(?=\s|[.,!?;:]|$)/g, "$1$2")
+      .trim();
     return line.length > maxChars ? line.slice(0, maxChars - 1).trimEnd() + "…" : line;
   }
   return "";
