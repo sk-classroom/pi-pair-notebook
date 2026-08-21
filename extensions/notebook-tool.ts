@@ -209,6 +209,19 @@ function bootstrapNotebook(): void {
     const nb = path.join(process.cwd(), "notebook.py");
     const tpl = path.join(process.cwd(), "notebook.template.py");
     if (!fs.existsSync(nb) && fs.existsSync(tpl)) fs.copyFileSync(tpl, nb);
+    // marimo's session snapshot RESTORES pressed buttons, and the cells behind
+    // ours have side effects: every send button appends a line to
+    // student_signal.txt, which the watcher below reads as the student acting
+    // right now. So a session that reopens one of those snapshots replays the
+    // last press. A gate run caught the worst version — the ⚖️ appeal replayed
+    // one second after boot, and a nervous novice's first turn carried a
+    // referee verdict about a case they never filed, on a session where
+    // nothing had happened yet. The photo and code send buttons replay the
+    // same way: the tutor is told a photo just arrived, and goes looking at
+    // the last session's picture. Drop the snapshot before the server starts;
+    // a live session re-runs every cell anyway and writes a fresh one.
+    const snap = path.join(process.cwd(), "__marimo__", "session", "notebook.py.json");
+    if (fs.existsSync(snap)) fs.rmSync(snap, { force: true });
   } catch {
     // startMarimo will fail loudly enough if this mattered
   }
@@ -297,11 +310,40 @@ function startMarimo(): Promise<{ url?: string; error?: string }> {
       return done({ error: `could not start the notebook server: ${e?.message ?? e}` });
     }
     marimoProc = child;
+    // The FIRST url marimo prints is not always the one it ends up serving.
+    // `--sandbox` makes it re-exec itself inside an isolated uv environment,
+    // and the second process binds again — on a different port when the first
+    // one is taken, which on a machine running more than one session it often
+    // is. Settling on the first match left the tutor talking to a port nothing
+    // was listening on, while a perfectly good server ran next door: every
+    // nb_* call failed, the student saw "something hiccuped", and the log
+    // recorded a URL that answered a curl by hand. Seen twice in one gate run.
+    //
+    // So a candidate is not a server until it answers. Take the newest URL
+    // printed, poll it, and abandon that poll the moment a newer one appears.
+    let candidate = "";
+    const verify = async (url: string) => {
+      for (let i = 0; i < 60 && !settled && candidate === url; i++) {
+        try {
+          const res = await fetch(`${url}/api/sessions`, {
+            signal: AbortSignal.timeout(2_000),
+          });
+          if (res.ok) return done({ url });
+        } catch {
+          // not up yet, or not this port at all
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    };
     const scan = (chunk: Buffer) => {
       log?.write(chunk);
       seen += chunk.toString();
-      const m = /http:\/\/[A-Za-z0-9.\-]+:\d+/.exec(seen);
-      if (m) done({ url: m[0] });
+      const all = seen.match(/http:\/\/[A-Za-z0-9.\-]+:\d+/g) ?? [];
+      const latest = all[all.length - 1];
+      if (latest && latest !== candidate) {
+        candidate = latest;
+        void verify(latest);
+      }
     };
     child.stdout?.on("data", scan);
     child.stderr?.on("data", scan);
@@ -1292,6 +1334,16 @@ function loadChapters(): Chapter[] {
   }
 }
 
+/** The module's own id, from lesson/index.json ("m01-euler-tour"). */
+function moduleId(): string {
+  try {
+    const raw = fs.readFileSync(path.join(process.cwd(), "lesson", "index.json"), "utf-8");
+    return String(JSON.parse(raw).module ?? "");
+  } catch {
+    return "";
+  }
+}
+
 /** Flat checkpoint order across all chapters — the script is the authority. */
 function checkpointOrder(): string[] {
   return loadChapters().flatMap((c) => c.checkpoints);
@@ -1599,9 +1651,49 @@ let studentSaidMark = 0;
 const INJECTED_PREFIX =
   /^(CHAPTER SCRIPT|RESUME CONTEXT|=== TUTORING HANDOFF|The student clicked|Please start the tutoring session|── Chapter |NOTE \(invisible to the student\)|REFEREE VERDICT)/;
 
+/**
+ * Curriculum prose that must never be filed as something the student said.
+ *
+ * The prefix test above catches an injected message by how it STARTS, which
+ * is enough while the message arrives whole. It did not hold: a graded row
+ * in this repo carries 44 words of chapter-opening prose as the student's
+ * first verbatim utterance, quoted back at them inside their own note cell
+ * under "What I said we could throw away". The opening reaches the model
+ * nested inside the CHAPTER SCRIPT message (chapterScriptMessage quotes it,
+ * so the tutor does not read it aloud), and something between there and
+ * getBranch() — compaction is the suspect — hands it back as a bare user
+ * turn with the prefix gone.
+ *
+ * Rather than guess at the path, refuse the CONTENT. A student does not type
+ * their own chapter opening word for word, so an exact match is safe, and it
+ * closes the hole whatever re-wraps the message. Memoised per chapter file:
+ * this runs once per captured message.
+ */
+let scriptProseCache: { key: string; set: Set<string> } | null = null;
+function scriptProse(): Set<string> {
+  const key = currentChapterId() ?? "";
+  if (scriptProseCache?.key === key) return scriptProseCache.set;
+  const set = new Set<string>();
+  try {
+    for (const ch of loadChapters()) {
+      const op = chapterOpening(ch);
+      // Openings only. Chapter TITLES were in here for one draft, and one of
+      // them is the single word "Abstraction" — which is exactly what a
+      // student may type as their answer at cp2_abstraction. A guard against
+      // losing the student's words must not be the thing that loses them.
+      if (op && op.length > 80) set.add(op);
+    }
+  } catch {
+    // no chapters is not a reason to lose the student's words
+  }
+  scriptProseCache = { key, set };
+  return set;
+}
+
 function allStudentMessages(ctx: any): string[] {
   const entries: any[] = ctx?.sessionManager?.getBranch?.() ?? [];
   const out: string[] = [];
+  const prose = scriptProse();
   for (const e of entries) {
     if (e?.type !== "message" || e?.message?.role !== "user") continue;
     const c = e.message.content;
@@ -1615,7 +1707,7 @@ function allStudentMessages(ctx: any): string[] {
               .join("\n")
           : "";
     const s = text.trim();
-    if (!s || INJECTED_PREFIX.test(s)) continue;
+    if (!s || INJECTED_PREFIX.test(s) || prose.has(s)) continue;
     out.push(s);
   }
   return out;
@@ -2046,6 +2138,50 @@ function scriptedBuildCells(cpId: string): string[] {
   return out;
 }
 
+/**
+ * Of a checkpoint's build cells, the ones that actually ask for a photograph.
+ *
+ * A cell holds a drop area when it CREATES one — `mo.ui.file(...)` — which is
+ * the same test nb_add_template uses to decide whether to tell the tutor to
+ * ask for the page. The photo gate below used to look at the cell's NAME
+ * instead, and any name ending in `_photo` armed it. m01's chapter 3 reveals
+ * the 1944 bombing with a historical plate in a cell called
+ * `cp3_bombed_photo`: display-only, nothing to upload, and no ask anywhere in
+ * the script. Closing that checkpoint was refused with "no photo has reached
+ * me", and the second attempt logged it stamped `photo_missing`, which the
+ * closing summary prints as a page the student never took. Two guards reading
+ * the same build disagreed about what a photo cell is; now they run the same
+ * test.
+ */
+function scriptedPhotoCells(cpId: string): string[] {
+  const build = checkpointBlock(cpId, "build");
+  if (!build.trim() || /^\s*none\s*$/i.test(build)) return [];
+  const out: string[] = [];
+  for (const m of build.matchAll(/nb_add_template\(\s*(?:template\s*=\s*)?["']([\w-]+)["']/g)) {
+    try {
+      const src = fs.readFileSync(path.join(process.cwd(), "cells", `${m[1]}.py`), "utf-8");
+      // Split on the cell markers, keeping each name with the body under it.
+      const parts = src.split(/^#\s*---\s*cell:\s*(\w+)\s*---$/m);
+      for (let i = 1; i < parts.length; i += 2) {
+        if (/\bmo\.ui\.file\s*\(/.test(parts[i + 1] ?? "")) out.push(parts[i]);
+      }
+    } catch {
+      // an unknown template name is nb_add_template's problem, not ours
+    }
+  }
+  return out;
+}
+
+/**
+ * How many questions the checkpoint's own script asks, counted from the
+ * numbered list in its `ask` block ("1." … "2." …). Zero when the block does
+ * not number them, which switches the check that uses this off rather than
+ * guessing.
+ */
+function scriptedQuestionCount(cpId: string): number {
+  return (checkpointBlock(cpId, "ask").match(/^\s*\d+\.\s/gm) ?? []).length;
+}
+
 /** The «…» markers of a note skeleton, in order. */
 function slotMarkers(skeleton: string): string[] {
   return skeleton.match(/«[^»]*»/g) ?? [];
@@ -2076,6 +2212,13 @@ const ACK_WORDS = new Set(
     "hm hmm mm uh huh thanks thanku thank you cool nice great awesome perfect makes sense " +
     "understood understand lets go going next continue done finished fine alright allright " +
     "sounds good please well so and then ill let s " +
+    // normMsg strips the apostrophe, so "let's" arrives as "lets" and never
+    // matched the "let" + "s" pair above. With the words that travel with it:
+    // "yeah lets keep going" answered the tutor's "ready to move on?" after a
+    // detour and was filed in the next checkpoint's note as the student's
+    // worked answer, between two real ones. Every word must be an ack word
+    // for a message to be dropped, so these cannot swallow an answer alone.
+    "lets keep carry on move moving ahead forward " +
     // A whole turn answering the tutor's own offer — "yeah, a quick note would
     // be nice" — is not the student's work, and a live run left it sitting in
     // the note between two real answers. `yes` and `no` stay OUT: they can be
@@ -2710,6 +2853,11 @@ export default function (pi: ExtensionAPI) {
   // guard in the file: whenever the open checkpoint ended up wrong, every
   // build refused forever and the only escape it named wrote a duplicate row.
   const buildOrderWarned = new Map<string, number>();
+  // The late-close refusal, per checkpoint. A close that arrives long after
+  // the answer did takes the NEXT checkpoint's turns with it — the capture
+  // only resets here — and the model's own hint count has stopped matching
+  // what happened. See the guard in checkpoint_done.
+  const lateCloseWarned = new Map<string, number>();
   // Checkpoints an EARLIER session left unlogged. Reported to the tutor at
   // resume and then treated as settled: the brief says not to go back for
   // them, so nothing downstream may order it to.
@@ -3119,9 +3267,15 @@ export default function (pi: ExtensionAPI) {
                 `is, answer it properly, leave a souvenir cell (mo.vstack: note + netviz/figure ` +
                 `— never ASCII art), log the detour, then call chapter_done again.`
               : choice === MORE
-                ? `The student wants MORE PRACTICE. Do NOT advance. Improvise ONE problem of ` +
-                  `the same kind on NEW data, reusing this module's objects (the 4-person ` +
-                  `network, the 8-dot ring) so the numbers stay comparable. Guide, judge, log ` +
+                ? // Named objects belong to whichever module wrote them, and this
+                  // string is read by every module that installs the toolkit: it
+                  // used to send the Königsberg tutor off to improvise on "the
+                  // 4-person network, the 8-dot ring", which are the small-world
+                  // module's and exist nowhere in this one. The scripts already
+                  // carry the right data for exactly this, per checkpoint.
+                  `The student wants MORE PRACTICE. Do NOT advance. Improvise ONE problem of ` +
+                  `the same kind on NEW data — the fresh_variants of the checkpoint you just ` +
+                  `finished, or the same recipe on this module's own objects. Guide, judge, log ` +
                   `it as extra practice (never a fail), then call chapter_done again.`
                 : choice === TYPE_IT && typed
                   ? `Do NOT advance. The student typed this instead of picking a row — these ` +
@@ -3378,7 +3532,10 @@ export default function (pi: ExtensionAPI) {
       // answer, to a schema rejection it never sees the text of.
       hints_used: Type.Optional(
         Type.Union([Type.Number(), Type.String()], {
-          description: "How many hints you gave (0 is fine and normal).",
+          description:
+            "How many hints you gave. A hint is any question you asked BECAUSE " +
+            "their answer was not there yet — one counts, even if they got it on " +
+            "the next turn. 0 only if they answered every part first time.",
         }),
       ),
       notes: Type.String({ description: "One line: what their answer showed." }),
@@ -3480,7 +3637,7 @@ export default function (pi: ExtensionAPI) {
       // through (nb_view_image saw it) or the student said they cannot take
       // one — and in that case the record should say so. One nudge, then it
       // logs either way with the gap on the row.
-      const wantPhotos = wantCells.filter((c) => /_photo$/.test(c));
+      const wantPhotos = scriptedPhotoCells(baseCheckpointId(id));
       // The in-memory set dies with the process, but the photo itself does
       // not: nb_view_image saves the original under assets/uploads/. Consult
       // both, or a resume after a photo was already read re-fires the
@@ -3750,7 +3907,17 @@ export default function (pi: ExtensionAPI) {
       // student), and only real invention — a figure or three content words
       // they never produced — is bounced back to the model.
       let responseSnappedFrom: string | null = null;
-      if (said.length > 0) {
+      // A bracketed stage direction is not a quote and must survive the snap.
+      // Two checkpoints in this course pin one: `(no answer — moved on)`, and
+      // cp0_welcome's `(nothing was asked — the session opened straight into
+      // the story)`, which its script pins BECAUSE the record's headline is
+      // the first thing a cold reader meets. The student still types
+      // something at cp0 — "hi", "start" — so the snap replaced the pinned
+      // literal with that word, and the graded record opened with
+      // "start" as the answer to "(nothing asked — the session just opened)".
+      // The script could not win against the repair; now it does not have to.
+      const stageDirection = /^\((?:nothing|no answer)\b/i.test(response.trim());
+      if (said.length > 0 && !stageDirection) {
         const snapped = snapToTranscript(response, said);
         if (snapped) {
           responseSnappedFrom = response;
@@ -3823,6 +3990,34 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
+      // A hand-written note is the one place words can be put in the
+      // student's mouth. Every other note cell is a skeleton whose «verbatim»
+      // slot the extension fills from the transcript — but a checkpoint with
+      // no skeleton (a practice round, a script with no `note:`) takes
+      // note_markdown, written by the model, blockquote and all. A live run
+      // wrote `> "P is 3, Q is 3, R is 2"` under "I worked out", while the log
+      // beside it held the student's three actual sentences. Nobody had said
+      // the quoted line. Same test as the slots, on the blockquote lines only:
+      // the prose above the fold is the tutor's own and is not checked.
+      if (!noteSuppressed(id) && !noteSkeleton(id) && said.length > 0) {
+        const quoted = String(params.note_markdown ?? "")
+          .split("\n")
+          .filter((l) => /^\s*>/.test(l))
+          .map((l) => l.replace(/^\s*>\s?/, ""))
+          .join(" ")
+          .trim();
+        if (quoted) {
+          const d = slotDrift(quoted, pool);
+          if (d.numbers.length > 0 || d.words.length >= 3) {
+            problems.push(
+              `the quote in note_markdown ("${quoted.slice(0, 80)}") adds ` +
+                [...d.numbers, ...d.words].map((t) => `"${t}"`).join(", ") +
+                ` — quote their turns as they typed them, joined with " · "`,
+            );
+          }
+        }
+      }
+
       // Two refusals per checkpoint, then it logs anyway with the drift
       // flagged for the grader: a model that cannot satisfy the check must
       // never be able to strand the student mid-lesson.
@@ -3855,6 +4050,70 @@ export default function (pi: ExtensionAPI) {
               ? ` They picked: ${picked.map((p) => `"${p}"`).join(", ")} — record THAT.`
               : "") +
             ` Then call checkpoint_done again.`,
+          failed: false,
+        });
+      }
+      // ── The close that came too late ────────────────────────────────────
+      // The verbatim capture resets HERE and nowhere else, so a close that
+      // waits until the next question is already being answered files two
+      // checkpoints' words under one id. A gate run did exactly that: the
+      // student was walked pair-by-pair through cp2_distance, then answered
+      // "can you just tell me the answer?" and cp2_diameter's "the A-D one is
+      // the tallest bar" — and all nine lines, both checkpoints', landed in
+      // cp2_distance's row, logged `pass` with zero hints. cp2_diameter's own
+      // row kept a single line and lost the hint it was given. Nothing in the
+      // record said any of this happened.
+      //
+      // The turn count is the tell. A checkpoint answered when it is asked
+      // closes in a handful of turns; the ⚖️ nudge already treats STUCK_TURNS
+      // as "these two are going round". Zero hints after that many turns is
+      // not a clean pass, whatever the model believes it remembers. Refuse
+      // once — the model gets to recount, and to close the next one on time —
+      // then log whatever comes back, because a guard that will not let go is
+      // a student stuck at a checkpoint they have already finished.
+      // The same zero, caught earlier. The turn count above only fires after
+      // twelve turns, and a checkpoint can be guided through in five: two live
+      // runs logged `pass` with no hints on rows whose own verbatim array
+      // holds the wrong first answer that a hint corrected, and one of them
+      // wrote "invented it unprompted" in the notes beside it.
+      //
+      // The tell that IS in reach: a scripted checkpoint asks a known number
+      // of questions, and every extra message the student sent is one the
+      // tutor asked for. More answers than questions, with no hints, is worth
+      // one look. Conservative on purpose — the count is taken only from an
+      // `ask` block that numbers its questions, a multi-part answer typed as
+      // two messages costs one extra tool call and nothing else, and the
+      // nudge says so.
+      const qCount = scriptedQuestionCount(baseCheckpointId(id));
+      const moreAnswersThanQuestions = qCount > 0 && said.length > qCount;
+      const lateStrikes = lateCloseWarned.get(id) ?? 0;
+      if (
+        (turnsInCheckpoint >= STUCK_TURNS || moreAnswersThanQuestions) &&
+        Math.round(Number(params.hints_used ?? 0) || 0) === 0 &&
+        judgment !== "prediction" &&
+        lateStrikes < 1
+      ) {
+        lateCloseWarned.set(id, lateStrikes + 1);
+        return toResult({
+          out:
+            `NOT LOGGED — ` +
+            (moreAnswersThanQuestions
+              ? `this checkpoint's script asks ${qCount} question${qCount === 1 ? "" : "s"} ` +
+                `and the student sent ${said.length} answers, `
+              : `this checkpoint has been open for ${turnsInCheckpoint} turns `) +
+            `and you are logging it with no hints. Two things to fix, in this order.\n` +
+            `1. hints_used: count the smaller questions you asked to get them there. ` +
+            `A question you asked because an answer was not there yet is a hint, even ` +
+            `if they got it on the very next turn — and "unprompted" does not belong ` +
+            `in the notes of a row like that. Hints are never held against the ` +
+            `student; a wrong count is what damages the record. If they really did ` +
+            `answer everything first time (two messages for one two-part answer, say), ` +
+            `send it again unchanged and it will log.\n` +
+            `2. If you have already moved on to the next question, this close is late, ` +
+            `and everything they typed since — including their answer to the NEXT ` +
+            `checkpoint — is about to be filed under this one. Close a checkpoint the ` +
+            `moment its answer lands, before you ask the next thing.\n` +
+            `Then call checkpoint_done again. It will log whatever you send this time.`,
           failed: false,
         });
       }
@@ -4777,9 +5036,19 @@ export default function (pi: ExtensionAPI) {
           .filter((c) => /\bmo\.ui\.file\s*\(/.test(c.code))
           .map((c) => c.name);
         const uploadLine = uploads.length
-          ? `ASK FOR THE PHOTO NOW, in one line, and then WAIT — never ask whether it is ` +
-            `up. Their 📨 Send to my tutor press starts your turn; then call ` +
-            `nb_view_image(widget="${uploads[0]}", …).\n` +
+          ? `ASK FOR THE PHOTO with the question it belongs to, in one line, and then ` +
+            `WAIT — never ask whether it is up. Their 📨 Send to my tutor press starts ` +
+            `your turn; then call nb_view_image(widget="${uploads[0]}", …).\n` +
+            // "ASK FOR THE PHOTO NOW" is what this said, and a script that puts the
+            // drop area up a turn BEFORE the question could not win against it: the
+            // tutor announced the pen-and-paper step, built the cell and asked the
+            // question in one breath, spending the one deliberate pause the
+            // checkpoint has — the beat where "this one is a drawing" is allowed to
+            // land before the hard part arrives. If your script gives this build its
+            // own turn, keep that turn.
+            `If your CHAPTER SCRIPT gives this build a turn of its own before the ` +
+            `question, KEEP IT: say that beat, build this, and stop. The photo ask ` +
+            `goes with the question, on the next turn.\n` +
             `Say NOTHING about typing instead, and nothing about a camera, unless they ` +
             `have mentioned one at THIS checkpoint. A camera that was out an hour ago ` +
             `is not a fact about now: a live run opened here with "your camera was out ` +
@@ -5011,8 +5280,14 @@ export default function (pi: ExtensionAPI) {
       // compaction, are no longer anywhere in the model's context; a _view
       // cell is the only copy of the photograph inside the notebook; an _ed
       // cell is the code the student wrote. All three are the graded artifact.
+      // _preview holds no student work, which is how it got left off the list
+      // — but it is where the 📨 button is DEFINED, and _sent reads it, so
+      // deleting it leaves a protected cell referencing an unbound name and
+      // the student with no way to hand the photo in. Protect it too: the
+      // partial path below deletes what it is allowed to and reports success,
+      // so "only the unprotected one went" is not a safe failure.
       const names: string[] = Array.isArray(params.names) ? params.names.map(String) : [];
-      const PROTECTED = /(_note|_view|_photo|_ed|_out|_sent|_header)$|^session_record$/;
+      const PROTECTED = /(_note|_view|_photo|_preview|_ed|_out|_sent|_header)$|^session_record$/;
       const refused = names.filter((n) => PROTECTED.test(n));
       const allowed = names.filter((n) => !PROTECTED.test(n));
       if (refused.length && !allowed.length) {
@@ -5280,42 +5555,56 @@ export default function (pi: ExtensionAPI) {
   // dead air becomes a tiny extra lesson.
   //
   // HARD RULE — these lines are shown at random, so any one of them can land
-  // while any checkpoint is open. NOTHING here may state a fact this module
-  // asks the student to find: no hop count for Milgram or Facebook (cp1),
-  // no "put the cable across the ring" (cp4), no friendship/triangle counts
-  // (cp3, cp5), no "clustering stays while distance collapses" mechanism
-  // (cp6), and no "high clustering AND short paths" definition (cp5_tension,
-  // cp7). Context and history are fine; answers are not.
-  const TRIVIA = [
-    // — where the mathematics came from —
-    "Euler invented network theory in 1736 to settle a stroll — the 7 bridges of Königsberg.",
-    "Two of Königsberg's seven bridges were lost in 1944, and the puzzle's answer changed with them.",
-    "Euler filed his bridge paper under 'geometry of position' — geometry with the distances thrown away.",
-    "Königsberg is Kaliningrad now; the city changed its name, and the puzzle kept his.",
+  // while any checkpoint is open, in ANY module that installs this toolkit.
+  // One list serves them all, so it must be clear of every module's answers.
+  //
+  // Small-world (m02): no hop count for Milgram or Facebook (cp1), no "put
+  // the cable across the ring" (cp4), no friendship/triangle counts (cp3,
+  // cp5), no "clustering stays while distance collapses" mechanism (cp6), and
+  // no "high clustering AND short paths" definition (cp5_tension, cp7).
+  //
+  // Königsberg (m01): no degree counts and no "two ends per edge, so the
+  // total is even" (cp2_degree), nothing about distances or sizes being
+  // irrelevant (cp2_abstraction), no odd-node rule and no 0-or-2 condition
+  // (cp3_parity, cp3_verdict), nothing about what the 1944 raid did to the
+  // answer (cp3_bombing), no connectivity clause (cp4_disconnected,
+  // cp6_redteam), and no indptr rule (cp5_csr). This module is the reason
+  // three of the lines below were rewritten: "geometry with the distances
+  // thrown away" is cp2_abstraction's gold answer in six words, "the puzzle's
+  // answer changed with them" is cp3_bombing's, and the handshake fact is the
+  // hint cp2_degree's teaching moment turns on. Context and history are fine;
+  // answers are not.
+  //
+  // And a line that says "this module" must be true in every module it can
+  // appear in. One claimed Karinthy asked the question behind "this whole
+  // module" — true next door, and simply false to a student reading about
+  // Euler.
+  //
+  // A NAME is an answer too. cp3_global_clustering asks the student what to
+  // call a trio with all three friendships present, and a tip reading "that's
+  // where triangles come from" handed the word over while the question was
+  // open — it cleared the count rule above and still lost the checkpoint. If
+  // a checkpoint asks "what would you call…", the word it wants is banned
+  // here as firmly as any number.
+  // Scoped by module. One flat list served every module, and an m01 student
+  // counting bridges was told "that 1998 Nature paper is three pages long" —
+  // about a paper nothing in their session had mentioned — along with karate
+  // clubs, Milgram's letters and C. elegans. None of it leaked an answer; all
+  // of it was orphaned, and half of it primes the NEXT module's subject in a
+  // course whose own rule is to point backward and never forward. Two live
+  // probes filed it independently.
+  //
+  // GENERAL is what survives anywhere: it may not depend on anything a
+  // particular module introduced, and it may not use "that"/"his"/"the famous
+  // result" to point at something the student has not met.
+  const TRIVIA_GENERAL = [
     "Leonhard Euler wrote roughly 850 papers — and kept publishing after going blind.",
     "Cayley counted trees in 1889 for the chemists, who wanted to know how many molecules were possible.",
     "The word 'graph' for a network comes from Sylvester, 1878 — borrowed from chemistry diagrams.",
     "The four-colour theorem, 1976, was the first famous proof a computer helped finish. It's about a graph.",
-    "Every network ever drawn has an even number of odd-degree dots. Nobody has found an exception.",
+    "Graph theory waited two centuries for its first textbook: Dénes König's, in 1936.",
     "Graph isomorphism — are these two drawings the same network? — still has no known fast algorithm.",
     "Thirty people allow more possible friendship patterns than the universe has atoms.",
-    // — the small-world question, before anyone measured it —
-    "Frigyes Karinthy dreamed up the question behind this whole module in a 1929 short story, 'Chains'.",
-    "J. A. Barnes coined 'social network' in 1954, studying a fishing parish in Norway.",
-    "Pool and Kochen wrote the small-world problem down around 1958; it sat unpublished for twenty years.",
-    "Stanley Milgram ran his letter experiment out of Harvard in the 1960s, with paper and stamps.",
-    "Milgram's first packets went out from Wichita, Kansas, before he moved the experiment to Omaha.",
-    "Milgram's small-world paper ran in the very first issue of Psychology Today, in 1967.",
-    "Most of Milgram's packets never arrived at all — the famous result rests on the ones that did.",
-    "In Milgram's Boston study, one clothing merchant handed over a quarter of the letters that arrived.",
-    "Milgram's other field experiment: drop stamped letters in the street and see which strangers post them.",
-    "In 2003 a team reran Milgram's experiment by email: 24,163 chains, 18 targets, 166 countries.",
-    // — 1998 and the model —
-    "Watts & Strogatz published their network model in Nature in 1998; it has been cited over 50,000 times.",
-    "That 1998 Nature paper is three pages long, figures included.",
-    "Duncan Watts came to networks from crickets — he was studying how they chirp in sync.",
-    "The original three networks studied in 1998: film actors, the US power grid, and a worm's brain.",
-    "The C. elegans worm's entire nervous system is mapped — all 302 neurons of it.",
     "A fruit fly's whole brain was mapped in 2024: about 140,000 neurons, 50 million connections.",
     "Complete wiring maps exist for a worm, a fly, and one cubic millimetre of mouse cortex. That's the list.",
     "Neuroscience calls the brain's wiring diagram a connectome — network science, with wetware.",
@@ -5336,8 +5625,8 @@ export default function (pi: ExtensionAPI) {
     "The Oracle of Bacon has been computing actor distances on the web since 1996.",
     // — how sociologists got here —
     "Granovetter, 1973: people find jobs through acquaintances, not close friends. Weak ties win.",
-    "That weak-ties paper was rejected in 1969. It is now one of the most cited in all of sociology.",
-    "Triadic closure: your friend's friend tends to become your friend. That's where triangles come from.",
+    "Granovetter's weak-ties paper was rejected in 1969. It is now one of the most cited in all of sociology.",
+    "Simmel, 1908: add one person to a pair and you get politics — alliances, mediators, majorities.",
     "Moreno drew the first social network by hand in 1933; the New York Times covered it.",
     "Moreno's first sociograms were drawn to explain a wave of runaways at a girls' reform school.",
     "Network scientists call a network's own map of itself a 'sociogram' — Moreno's word, still in use.",
@@ -5351,7 +5640,7 @@ export default function (pi: ExtensionAPI) {
     "The web, citation networks, and Hollywood all share one shape: a few superstar hubs.",
     "Hub networks shrug off random failures — but fall fast to targeted attacks on hubs.",
     "Barabási and Albert, 1999: hubs come from growth plus the rich getting richer.",
-    "That rich-get-richer idea is older than the web: Yule in 1925, Simon in 1955, Price in 1965.",
+    "The rich-get-richer idea is older than the web: Yule in 1925, Simon in 1955, Price in 1965.",
     "Merton named it the Matthew effect in 1968 — credit flows to whoever already has some.",
     "PageRank is network centrality: where an endlessly clicking web surfer ends up.",
     "PageRank's imaginary surfer gets bored about 15% of the time and jumps to a page at random.",
@@ -5360,8 +5649,41 @@ export default function (pi: ExtensionAPI) {
     "A follow graph is directed: on Twitter, most friendships only point one way.",
     "Epidemiologists model outbreaks on contact networks, not on crowds of interchangeable people.",
     "Dot and line, vertex and edge, actor and tie, site and bond — four fields, one picture.",
-    "This notebook is a network too: marimo links each cell to the ones it feeds, and re-runs those.",
+    "This notebook is a network too: change one thing and everything downstream of it redraws itself.",
   ];
+
+  // Lines that belong to ONE module's story — shown only inside it, where the
+  // student has met the thing they refer to. The same rule about answers
+  // applies here twice over: these land in the module whose checkpoints are
+  // about exactly this material.
+  const TRIVIA_BY_MODULE: Record<string, string[]> = {
+    "m01-euler-tour": [
+      "Euler invented network theory in 1736 to settle a stroll — the 7 bridges of Königsberg.",
+      "Königsberg's seven bridges went up between 1286 and 1542 — Euler wrote about the set his own century inherited.",
+      "Euler filed his bridge paper under a heading of his own invention: 'the geometry of position'.",
+      "Königsberg is Kaliningrad now; the city changed its name, and the puzzle kept his.",
+      "Euler read his bridge paper to the St Petersburg Academy in 1735; it was printed in 1741.",
+    ],
+    "m02-small-world": [
+      "Frigyes Karinthy dreamed up the six-degrees question in a 1929 short story, 'Chains'.",
+      "J. A. Barnes coined 'social network' in 1954, studying a fishing parish in Norway.",
+      "Pool and Kochen wrote the small-world problem down around 1958; it sat unpublished for twenty years.",
+      "Stanley Milgram ran his letter experiment out of Harvard in the 1960s, with paper and stamps.",
+      "Milgram's first packets went out from Wichita, Kansas, before he moved the experiment to Omaha.",
+      "Milgram's small-world paper ran in the very first issue of Psychology Today, in 1967.",
+      "Most of Milgram's packets never arrived at all — the famous result rests on the ones that did.",
+      "In Milgram's Boston study, one clothing merchant handed over a quarter of the letters that arrived.",
+      "Milgram's other field experiment: drop stamped letters in the street and see which strangers post them.",
+      "In 2003 a team reran Milgram's experiment by email: 24,163 chains, senders in 166 countries.",
+      "Watts & Strogatz published their network model in Nature in 1998; it has been cited over 50,000 times.",
+      "The Watts-Strogatz paper is three pages long, figures included.",
+      "Duncan Watts came to networks from crickets — he was studying how they chirp in sync.",
+      "The original three networks studied in 1998: film actors, the US power grid, and a worm's brain.",
+      "The C. elegans worm's entire nervous system is mapped — all 302 neurons of it.",
+    ],
+  };
+
+  const TRIVIA = [...TRIVIA_GENERAL, ...(TRIVIA_BY_MODULE[moduleId()] ?? [])];
   let triviaIdx = Math.floor(Math.random() * TRIVIA.length);
   let triviaTimer: ReturnType<typeof setInterval> | null = null;
   const showTrivia = (ctx: any) => {
