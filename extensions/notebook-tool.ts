@@ -1330,11 +1330,21 @@ async function askStudent(
 ): Promise<{ choice: string | null; typed: string; asked: boolean }> {
   if (!ctx?.ui?.select) return { choice: null, typed: "", asked: false };
   quietForPicker = true;
-  // Silencing the timer is not enough: a tip set moments earlier is still on
-  // screen, and it sits between the reveal and the picker for as long as the
-  // student takes to choose. Clear it as the dialog opens.
+  // Two things share the space between the reveal and the dialog, and both
+  // used to say the machine was busy while in fact it was the student's turn.
+  //
+  // The tip is one: silencing the timer is not enough, because a tip set
+  // moments earlier stays on screen for as long as the student takes to
+  // choose. The spinner is the other, and it cannot be taken down — a tool
+  // that opens a picker has not returned, so pi is legitimately mid-turn, and
+  // its "📝 …" call line keeps its place too (rendered once, at call time,
+  // and not re-rendered while the dialog is up — tried).
+  //
+  // What CAN be fixed is what they say. A spinner beside "waiting for your
+  // answer" reads as what it is; beside a stale tip, or nothing at all, it
+  // reads as "still loading, please wait" next to a question waiting on them.
   try {
-    ctx?.ui?.setWorkingMessage?.("");
+    ctx?.ui?.setWorkingMessage?.("waiting for your answer");
   } catch {
     /* cosmetic */
   }
