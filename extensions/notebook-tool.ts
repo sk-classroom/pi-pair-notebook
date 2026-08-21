@@ -1251,12 +1251,95 @@ async function preflightProvider(ctx: any): Promise<string | null> {
 // of habit finds the way through in the list they are already looking at.
 const TYPE_IT = "✎ Let me type something instead";
 
+/**
+ * True while a picker is on screen, read by the trivia timer.
+ *
+ * A tip is for dead air — the long wait on a model call or a vision read —
+ * and the seconds around a picker are the opposite of dead air. The tutor has
+ * just delivered the reveal, and every line printed under it pushes it further
+ * up a terminal the student may not think to scroll. Live, in order: the
+ * reveal, a tool status line, a tip, a separator, the picker. On a short
+ * window the payoff is off the top and the student answers "Where to next?"
+ * having never read what their answer bought them.
+ */
+let quietForPicker = false;
+
+/**
+ * The last thing the tutor SAID, short enough to sit on top of a picker.
+ *
+ * The reveal is the payoff for the answer the student just gave, and the
+ * picker that follows it is titled "Where to next?" and nothing else — so
+ * when the reveal has scrolled off the top, the student is choosing with no
+ * idea what they were shown. Carrying the last line into the dialog costs a
+ * line of repetition when it is still visible, and saves the whole beat when
+ * it is not.
+ */
+function lastTutorLine(ctx: any, maxChars = 150): string {
+  const entries: any[] = ctx?.sessionManager?.getBranch?.() ?? [];
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (e?.type !== "message" || e?.message?.role !== "assistant") continue;
+    const c = e.message.content;
+    const text = (
+      typeof c === "string"
+        ? c
+        : Array.isArray(c)
+          ? c
+              .filter((p: any) => p?.type === "text" && typeof p.text === "string")
+              .map((p: any) => p.text)
+              .join("\n")
+          : ""
+    ).trim();
+    if (!text) continue;
+    // The last SENTENCE, not the last line. A reveal is two sentences on one
+    // line as often as not, and cutting that at a character count ends the
+    // dialog mid-clause — "…at most two odd nodes for a trail, and none at…",
+    // which is worse than showing nothing. The final sentence is also the one
+    // the beat lands on: "Königsberg has four odd nodes, so it has neither."
+    const flat = text.replace(/\s+/g, " ").trim();
+    const parts = flat.split(/(?<=[.!?])\s+/).filter(Boolean);
+    // The last two sentences when they fit, not just the last one. A reveal
+    // is two sentences by contract, and the last of them is often the optional
+    // extra beat — "And the citizens had asked for the circuit" — while the
+    // punchline is the one before it. Taking both, when both fit, is the whole
+    // beat rather than its tail.
+    let line = parts[parts.length - 1] ?? flat;
+    if (parts.length > 1) {
+      const pair = `${parts[parts.length - 2]} ${line}`;
+      if (pair.length <= maxChars) line = pair;
+    }
+    return line.length > maxChars ? line.slice(0, maxChars - 1).trimEnd() + "…" : line;
+  }
+  return "";
+}
+
 async function askStudent(
   ctx: any,
   title: string,
   options: string[],
 ): Promise<{ choice: string | null; typed: string; asked: boolean }> {
   if (!ctx?.ui?.select) return { choice: null, typed: "", asked: false };
+  quietForPicker = true;
+  // Silencing the timer is not enough: a tip set moments earlier is still on
+  // screen, and it sits between the reveal and the picker for as long as the
+  // student takes to choose. Clear it as the dialog opens.
+  try {
+    ctx?.ui?.setWorkingMessage?.("");
+  } catch {
+    /* cosmetic */
+  }
+  try {
+    return await askStudentInner(ctx, title, options);
+  } finally {
+    quietForPicker = false;
+  }
+}
+
+async function askStudentInner(
+  ctx: any,
+  title: string,
+  options: string[],
+): Promise<{ choice: string | null; typed: string; asked: boolean }> {
   const choice = await ctx.ui.select(`${title}   ↑↓ then Enter`, [...options, TYPE_IT]);
   if (choice !== TYPE_IT) return { choice: choice ?? null, typed: "", asked: true };
   let typed = "";
@@ -2676,9 +2759,22 @@ function buildSessionSummary(entries: any[], allCheckpoints: string[]): string {
   const done = new Set(cps.map((e) => baseCheckpointId(String(e.id))));
   const extras = cps.filter((e) => /_extra/.test(String(e.id))).length;
   const missing = allCheckpoints.filter((id) => !done.has(id));
+  // Which curriculum produced this. A module gets edited between terms, and a
+  // grader reading a submission six weeks later has no other way to tell which
+  // version of a checkpoint the student actually met.
+  const modId = moduleId();
+  const modVer = (() => {
+    try {
+      const raw = fs.readFileSync(path.join(process.cwd(), "lesson", "index.json"), "utf-8");
+      return String(JSON.parse(raw).version ?? "");
+    } catch {
+      return "";
+    }
+  })();
   const out = [
     "# Session summary",
     "",
+    ...(modId ? [`Module: ${modId}${modVer ? ` v${modVer}` : ""}`] : []),
     `Checkpoints completed: ${allCheckpoints.filter((id) => done.has(id)).length} of ${allCheckpoints.length}`,
     ...(extras ? [`Extra practice rounds asked for: ${extras}`] : []),
     `Detours (student's own questions): ${entries.filter((e) => e?.type === "detour").length}`,
@@ -4317,7 +4413,13 @@ export default function (pi: ExtensionAPI) {
       let paceAsked = false;
       if (ctx?.ui?.select) {
         paceAsked = true;
-        const { choice, typed } = await askStudent(ctx, "Where to next?", [READY, ASK_Q, MORE]);
+        // The reveal, above the question, so the beat survives a short window.
+        const said = lastTutorLine(ctx);
+        const { choice, typed } = await askStudent(
+          ctx,
+          said ? `${said}\n\nWhere to next?` : "Where to next?",
+          [READY, ASK_Q, MORE],
+        );
         const practiceRound = /_extra/.test(id);
         nextLine =
           choice === READY
@@ -4509,14 +4611,31 @@ export default function (pi: ExtensionAPI) {
 
       // The tag is the submission. Without it a push in tag mode is filed and
       // never graded, which is the failure this whole tool exists for.
-      const tag = submissionTag(sha);
-      const madeTag = gitRun(["tag", tag]).ok && gitRun(["push", "origin", tag]).ok;
+      //
+      // But only one tag per commit. A student who asks twice with nothing
+      // changed in between would otherwise get a second tag on the same sha,
+      // and each one starts its own grading run over identical work —
+      // classroom50 dedupes by sha on its side, so it is not wrong, just
+      // noise nobody asked for. Already tagged means already handed in, and
+      // saying so is a better answer than doing it again.
+      const existing = gitRun(["tag", "--points-at", "HEAD", "--list", "submit/*"])
+        .out.split("\n").map((s) => s.trim()).filter(Boolean);
+      let tag = existing[existing.length - 1] ?? "";
+      let madeTag = !!tag;
+      if (!tag) {
+        tag = submissionTag(sha);
+        madeTag = gitRun(["tag", tag]).ok && gitRun(["push", "origin", tag]).ok;
+      }
 
       return toResult({
         out:
-          `Handed in.${committed ? "" : " (Nothing new to commit — pushed what was there.)"} ` +
+          (committed
+            ? `Handed in. `
+            : existing.length
+              ? `Already handed in — nothing has changed since last time. `
+              : `Handed in (nothing new to commit — pushed what was there). `) +
           (madeTag
-            ? `Submission tag ${tag} pushed, which is what starts the grading.`
+            ? `Submission tag ${tag} is what starts the grading.`
             : `WARNING: the push worked but the submission tag did not, so this may not ` +
               `be graded — tell them to mention it to their instructor.`) +
           `\nSay it in ONE short line — "that's handed in" — and go straight back to the ` +
@@ -5892,6 +6011,7 @@ export default function (pi: ExtensionAPI) {
   let triviaIdx = Math.floor(Math.random() * TRIVIA.length);
   let triviaTimer: ReturnType<typeof setInterval> | null = null;
   const showTrivia = (ctx: any) => {
+    if (quietForPicker) return;
     try {
       const line = `Tip: ${TRIVIA[triviaIdx++ % TRIVIA.length]}`;
       ctx.ui.setWorkingMessage(ctx.ui.theme.fg("dim", line));
