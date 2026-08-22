@@ -2206,6 +2206,10 @@ function noteSkeleton(cpId: string): string {
  * code the student wants to see, and a cell about that is the first thing a
  * cold reader meets in a document that has not begun. The answer still gets
  * logged and still lands in the closing session_record.
+ *
+ * It suppresses the "where to next?" picker as well, for the same reason:
+ * mechanics ask the student nothing, so there is no answer to pace against.
+ * See the picker in checkpoint_done.
  */
 function noteSuppressed(cpId: string): boolean {
   try {
@@ -4431,7 +4435,22 @@ export default function (pi: ExtensionAPI) {
         `plain text whether they are ready, END YOUR TURN, and wait for their answer. ` +
         `Only when they say yes: ${goNext}`;
       let paceAsked = false;
-      if (ctx?.ui?.select) {
+      // A `note: none` checkpoint asked the student NOTHING. cp0 is the
+      // greeting, and its script says in as many words to say hello, close,
+      // and go straight into the first real checkpoint. Stopping there for
+      // "where to next?" offers three rows that are all false: there is no
+      // next question yet, no answer of theirs to have a question about, and
+      // "give me another one like that" points at a "one" that does not
+      // exist. A live run put that menu on screen ten seconds into the
+      // session, after the student had typed nothing but "hello", and made
+      // them press Enter on it before the lesson had begun. Nothing was
+      // asked, so there is nothing to pace.
+      if (suppressed) {
+        paceAsked = true;
+        nextLine =
+          `Nothing was asked here, so the student was NOT stopped to choose where to go ` +
+          `next — treat them as READY. ${goNext}`;
+      } else if (ctx?.ui?.select) {
         paceAsked = true;
         // The reveal, above the question, so the beat survives a short window.
         const said = lastTutorLine(ctx);
